@@ -1,0 +1,15 @@
+{
+  "title": "A task",
+  "description": "An example record schema. kharka checks type, enum, const, properties, required, additionalProperties, items, minimum, maximum, minLength, maxLength, minItems and maxItems; other keywords are ignored.",
+  "type": "object",
+  "required": ["title", "status"],
+  "properties": {
+    "title": { "type": "string", "minLength": 1, "maxLength": 300 },
+    "description": { "type": "string" },
+    "status": { "enum": ["now", "next", "waiting", "review", "later", "done"] },
+    "waiting_for": { "type": ["string", "null"] },
+    "assignee": { "type": ["string", "null"] },
+    "updated": { "type": "integer", "minimum": 0 }
+  },
+  "additionalProperties": true
+}

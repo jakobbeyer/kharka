@@ -1,0 +1,25 @@
+[package]
+name = "kharka"
+version = "0.0.1"
+edition = "2024"
+description = "A small local-first JSON store: every machine keeps a full replica, one hub orders and spreads the changes"
+license = "MIT"
+repository = "https://github.com/jakobbeyer/kharka"
+keywords = ["local-first", "sync", "replication", "database", "json"]
+categories = ["database", "command-line-utilities"]
+
+[dependencies]
+anyhow = "1.0.104"
+bytes = "1.12.1"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+crc32fast = "1.5.2"
+futures-util = { version = "0.3.34", features = ["sink"] }
+gethostname = "1.1.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "net", "io-util", "io-std", "process", "sync", "signal", "macros", "time"] }
+tokio-util = { version = "0.7.20", features = ["codec"] }
+toml = "1.1.8"
+
+[dev-dependencies]
+tempfile = "3.27.0"

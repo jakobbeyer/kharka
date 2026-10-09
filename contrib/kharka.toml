@@ -1,0 +1,20 @@
+# kharka.toml: the protected collections. Put it on the hub's machine as ~/.config/kharka/kharka.toml; the hub reloads
+# it when it changes, and every machine has the rules at once, also while the hub is away. Only this file changes
+# them; any machine may define further collections of its own (kharka collections set).
+
+# true: a key outside every collection is refused; false (the default): it is written unchecked.
+strict = false
+
+# What each machine reports about itself, as status/<node>. Only that node writes there; an entry not written again
+# within the TTL reads as stale.
+[collections.status]
+kind = "state"
+ttl = "30s"
+
+# Shared records: any machine writes, the latest write wins.
+[collections.tasks]
+kind = "record"
+schema = "task.schema.json"
+
+[collections.settings]
+kind = "record"
