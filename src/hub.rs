@@ -34,16 +34,48 @@ const BACKLOG: usize = 4096;
 /// Direct answers (confirmations, refusals) waiting for one connection; more are dropped: a dropped confirmation only
 /// means the write is pushed once more later.
 const ANSWERS: usize = 1024;
-/// A stamp further ahead of the hub's clock than this is refused: the sender's clock is wrong.
-const MAX_DRIFT_MS: u64 = 5 * 60 * 1000;
 const HANDSHAKE: Duration = Duration::from_secs(10);
-/// How often each side shows it is alive, and how long a silent connection is kept.
-pub const PING: Duration = Duration::from_secs(15);
-pub const SILENCE: Duration = Duration::from_secs(45);
 /// How often the hub looks whether kharka.toml or a schema file changed.
 const CONFIG_CHECK: Duration = Duration::from_secs(2);
 /// The longest reason kept with a refused write.
 const MAX_REASON: usize = 300;
+
+/// How often the hub pings, and how long a silent connection is kept (a daemon too gives up on a hub that stays
+/// silent this long).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Heartbeat {
+    pub ping: Duration,
+    pub silence: Duration,
+}
+
+impl Heartbeat {
+    /// A ping every `ping`; a connection is silent after three missed ones.
+    pub fn every(ping: Duration) -> Heartbeat {
+        Heartbeat {
+            ping,
+            silence: 3 * ping,
+        }
+    }
+
+    /// Says so when the heartbeat is not the default: only tests shorten it.
+    /// Says on stderr that the heartbeat is not the default one; `pings`: this side sends the pings (the hub), else it
+    /// only expects them (a daemon, which must be started with the hub's value).
+    pub fn announce(&self, pings: bool) {
+        if *self != Heartbeat::default() {
+            let what = if pings { "a ping every" } else { "the hub pings every" };
+            eprintln!(
+                "kharka: --heartbeat-ms is set: {what} {} ms, for tests only",
+                self.ping.as_millis()
+            );
+        }
+    }
+}
+
+impl Default for Heartbeat {
+    fn default() -> Heartbeat {
+        Heartbeat::every(Duration::from_secs(15))
+    }
+}
 
 pub struct Options {
     pub socket: PathBuf,
@@ -51,6 +83,7 @@ pub struct Options {
     /// The hub's own name in its stamps; must differ from every daemon's.
     pub node: String,
     pub config: Option<PathBuf>,
+    pub heartbeat: Heartbeat,
 }
 
 struct Hub {
@@ -62,6 +95,7 @@ struct Hub {
     /// The open connection of each node: its number, and how to close it when the node connects anew.
     connected: Mutex<HashMap<String, (u64, Arc<Notify>)>>,
     next_connection: AtomicU64,
+    heartbeat: Heartbeat,
 }
 
 /// Whether a key holds rules: a collection or the settings.
@@ -113,7 +147,8 @@ impl Hub {
     /// A write of the hub itself (`_nodes/…`, the protected collections, refused writes), numbered; `None` deletes.
     /// Goes into the open batch; the caller commits.
     fn write_own(store: &mut Store, key: String, value: Option<Value>) -> anyhow::Result<Entry> {
-        let entry = Entry::new(key, value, store.tick());
+        let hlc = store.stamp_over(&key);
+        let entry = Entry::new(key, value, hlc);
         Ok(store.accept(entry)?.0)
     }
 
@@ -282,7 +317,7 @@ impl Hub {
         if let Err(problem) = check_key(&entry.key) {
             return refuse(problem, false);
         }
-        if entry.hlc.wall_ms > wall_ms() + MAX_DRIFT_MS {
+        if entry.hlc.too_far_ahead(wall_ms()) {
             return refuse(
                 "stamped more than five minutes ahead of the hub: check the sender's clock".into(),
                 false,
@@ -330,7 +365,7 @@ fn restoring(entry: &Entry) -> Verdict {
         || entry.key == SETTINGS
         || (entry.key.starts_with(COLLECTIONS) && entry.value["protected"] == true);
     let unfit = check_key(&entry.key).is_err()
-        || entry.hlc.wall_ms > wall_ms() + MAX_DRIFT_MS
+        || entry.hlc.too_far_ahead(wall_ms())
         || entry.value.to_string().len() > MAX_VALUE;
     if own || unfit { Verdict::Skip } else { Verdict::Take }
 }
@@ -379,7 +414,9 @@ pub async fn run(options: Options, shutdown: impl Future<Output = ()>) -> anyhow
         epoch,
         connected: Mutex::new(HashMap::new()),
         next_connection: AtomicU64::new(1),
+        heartbeat: options.heartbeat,
     });
+    options.heartbeat.announce(true);
     hub.apply_file(&file)?;
     hub.everyone_offline()?;
     {
@@ -594,8 +631,8 @@ async fn serve(hub: &Arc<Hub>, stream: UnixStream) -> anyhow::Result<()> {
     read
 }
 
-/// Everything a node sends: pushes, and pongs. A connection silent for longer than `SILENCE` is dead (the other side
-/// pings every `PING`), as is one a newer connection of the same node replaced.
+/// Everything a node sends: pushes, and pongs. A connection silent for longer than the heartbeat's silence is dead (the
+/// other side pings every heartbeat), as is one a newer connection of the same node replaced.
 async fn read(
     hub: &Hub,
     node: &str,
@@ -606,7 +643,7 @@ async fn read(
     loop {
         let incoming = tokio::select! {
             () = closer.notified() => return Ok(()),
-            incoming = timeout(SILENCE, frame::recv(reader)) => {
+            incoming = timeout(hub.heartbeat.silence, frame::recv(reader)) => {
                 incoming.map_err(|_| anyhow!("{node} went silent"))??
             }
         };
@@ -632,7 +669,7 @@ struct Stream {
 }
 
 /// Everything to one node: the welcome, what it missed, `caught_up`, then every change in sequence order, the direct
-/// answers, and a ping every `PING`. A connection too slow for the stream is caught up from the log.
+/// answers, and a ping every heartbeat. A connection too slow for the stream is caught up from the log.
 async fn write(
     hub: Arc<Hub>,
     mut writer: FramedWrite<OwnedWriteHalf, LengthDelimitedCodec>,
@@ -653,7 +690,8 @@ async fn write(
     frame::send(&mut writer, &Frame::CaughtUp { seq }).await?;
     // the position in the hub's sequence, also across entries this node does not sync
     let mut last = seq;
-    let mut pings = tokio::time::interval_at(tokio::time::Instant::now() + PING, PING);
+    let ping = hub.heartbeat.ping;
+    let mut pings = tokio::time::interval_at(tokio::time::Instant::now() + ping, ping);
     loop {
         tokio::select! {
             change = changes.recv() => match change {
@@ -665,7 +703,8 @@ async fn write(
                         }
                     }
                 }
-                Err(RecvError::Lagged(_)) => {
+                Err(RecvError::Lagged(skipped)) => {
+                    eprintln!("kharka: {node} fell {skipped} changes behind the stream, caught up from the log");
                     let missed = {
                         let store = hub.store();
                         changes = hub.changes.subscribe();

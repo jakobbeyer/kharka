@@ -5,7 +5,9 @@ use serde_json::Value;
 
 use crate::hlc::Hlc;
 
+/// The longest key, in bytes.
 pub const MAX_KEY: usize = 256;
+/// The longest node name, in bytes.
 pub const MAX_NODE: usize = 64;
 /// The largest value, as JSON text.
 pub const MAX_VALUE: usize = 1 << 20;

@@ -23,7 +23,7 @@ use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 use crate::daemon::Shared;
 use crate::entry::{COLLECTIONS, Entry, NODES, SETTINGS};
 use crate::frame::{self, Frame, PROTOCOL};
-use crate::hub::SILENCE;
+use crate::hub::Heartbeat;
 use crate::paths;
 use crate::scope::Scope;
 use crate::storage::write_private;
@@ -77,12 +77,12 @@ impl fmt::Display for HubTarget {
 }
 
 /// Keeps a session with the hub up, retrying with a growing pause (1 s up to 30 s).
-pub(crate) async fn run(shared: Arc<Shared>, hub: HubTarget, data: PathBuf) {
+pub(crate) async fn run(shared: Arc<Shared>, hub: HubTarget, data: PathBuf, heartbeat: Heartbeat) {
     let mut pause = FIRST_RETRY;
     let mut last_problem = String::new();
     loop {
         let started = Instant::now();
-        let problem = match session(&shared, &hub, &data).await {
+        let problem = match session(&shared, &hub, &data, heartbeat).await {
             Ok(()) => "the hub closed the connection".to_string(),
             Err(err) => format!("{err:#}"),
         };
@@ -160,7 +160,7 @@ async fn connect(hub: &HubTarget) -> anyhow::Result<Connection> {
     })
 }
 
-async fn session(shared: &Arc<Shared>, hub: &HubTarget, data: &Path) -> anyhow::Result<()> {
+async fn session(shared: &Arc<Shared>, hub: &HubTarget, data: &Path, heartbeat: Heartbeat) -> anyhow::Result<()> {
     let Connection {
         mut reader,
         mut writer,
@@ -244,7 +244,7 @@ async fn session(shared: &Arc<Shared>, hub: &HubTarget, data: &Path) -> anyhow::
     push_pending(shared, data, &node, &mut writer).await?;
     let mut heard = Instant::now();
     loop {
-        let silence = tokio::time::sleep_until((heard + SILENCE).into());
+        let silence = tokio::time::sleep_until((heard + heartbeat.silence).into());
         tokio::select! {
             incoming = frame::recv(&mut reader) => {
                 heard = Instant::now();

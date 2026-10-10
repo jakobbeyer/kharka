@@ -96,18 +96,26 @@ pub fn socket(dir: &Path, node: &str) -> PathBuf {
 
 /// `kharka serve` with its data in `<dir>/hub` and `<dir>/kharka.toml` as config (when there is one).
 pub fn start_hub(dir: &Path) -> Process {
-    let hub = Process::start(
-        dir,
-        "hub",
-        kharka(dir)
-            .arg("serve")
-            .arg("--data")
-            .arg(dir.join("hub"))
-            .arg("--hub-socket")
-            .arg(hub_socket(dir))
-            .arg("--config")
-            .arg(dir.join("kharka.toml")),
-    );
+    start_hub_from(dir, &mut hub_command(dir))
+}
+
+/// The command `start_hub` runs, to add to.
+pub fn hub_command(dir: &Path) -> Command {
+    let mut command = kharka(dir);
+    command
+        .arg("serve")
+        .arg("--data")
+        .arg(dir.join("hub"))
+        .arg("--hub-socket")
+        .arg(hub_socket(dir))
+        .arg("--config")
+        .arg(dir.join("kharka.toml"));
+    command
+}
+
+/// Starts a hub command and waits for its socket.
+pub fn start_hub_from(dir: &Path, command: &mut Command) -> Process {
+    let hub = Process::start(dir, "hub", command);
     wait_for_socket(&hub_socket(dir));
     hub
 }
@@ -119,6 +127,13 @@ pub fn start_daemon(dir: &Path, node: &str, hub: Option<&str>) -> Process {
 
 /// `start_daemon` with more arguments, e.g. `--sync`.
 pub fn start_daemon_with(dir: &Path, node: &str, hub: Option<&str>, extra: &[&str]) -> Process {
+    let mut command = daemon_command(dir, node, hub);
+    command.args(extra);
+    start_daemon_from(dir, node, &mut command)
+}
+
+/// The command `start_daemon` runs, to add to.
+pub fn daemon_command(dir: &Path, node: &str, hub: Option<&str>) -> Command {
     let mut command = kharka(dir);
     command
         .arg("daemon")
@@ -133,8 +148,12 @@ pub fn start_daemon_with(dir: &Path, node: &str, hub: Option<&str>, extra: &[&st
     if let Some(hub) = hub {
         command.arg("--hub").arg(hub);
     }
-    command.args(extra);
-    let daemon = Process::start(dir, node, &mut command);
+    command
+}
+
+/// Starts the daemon command of `node` and waits for its socket.
+pub fn start_daemon_from(dir: &Path, node: &str, command: &mut Command) -> Process {
+    let daemon = Process::start(dir, node, command);
     wait_for_socket(&socket(dir, node));
     daemon
 }

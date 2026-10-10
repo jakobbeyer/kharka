@@ -21,6 +21,7 @@ use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 
 use crate::entry::{COLLECTIONS, Entry, MAX_VALUE, REJECTED, SETTINGS, check_key, check_prefix};
 use crate::hlc::{Hlc, wall_ms};
+use crate::hub::Heartbeat;
 use crate::schema::{Collections, check_definition};
 use crate::scope::Scope;
 use crate::socket;
@@ -45,6 +46,7 @@ pub struct Options {
     pub config: Option<PathBuf>,
     /// What this replica holds: everything, or the keys under some prefixes.
     pub sync: Scope,
+    pub heartbeat: Heartbeat,
 }
 
 pub(crate) struct Shared {
@@ -133,6 +135,7 @@ pub async fn run(options: Options, shutdown: impl Future<Output = ()>) -> anyhow
         options.sync,
         rules.summary()
     );
+    options.heartbeat.announce(false);
     let (changes, _) = broadcast::channel(BACKLOG);
     let (online, _) = watch::channel(false);
     let shared = Arc::new(Shared {
@@ -148,7 +151,7 @@ pub async fn run(options: Options, shutdown: impl Future<Output = ()>) -> anyhow
     });
     let syncing = options
         .hub
-        .map(|hub| tokio::spawn(sync::run(shared.clone(), hub, options.data.clone())));
+        .map(|hub| tokio::spawn(sync::run(shared.clone(), hub, options.data.clone(), options.heartbeat)));
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
@@ -401,14 +404,16 @@ fn handle(
         Request::Whoami => ok(&id, json!({ "node": shared.store().node() })),
         Request::Status => {
             let store = shared.store();
-            // writes the hub refused for good are not pending: they are no longer pushed
-            let pending = {
-                let refused = shared.refused();
-                store
-                    .pending()
+            // writes the hub refused for good are not pending: they are no longer pushed; and they count as refused only
+            // while they are held (a key written anew is no longer the refused write)
+            let (refused, pending) = {
+                let noted = shared.refused();
+                let pending = store.pending();
+                let refused = pending
                     .iter()
-                    .filter(|entry| !refused.contains(&(entry.key.clone(), entry.hlc.to_string())))
-                    .count()
+                    .filter(|entry| noted.contains(&(entry.key.clone(), entry.hlc.to_string())))
+                    .count();
+                (refused, pending.len() - refused)
             };
             let collections: Vec<String> = shared.rules().collections.keys().cloned().collect();
             ok(
@@ -421,7 +426,7 @@ fn handle(
                     "pending": pending,
                     "seq": store.last_seq(),
                     "collections": collections,
-                    "refused": shared.refused().len(),
+                    "refused": refused,
                     "sync": (!scope.is_everything()).then(|| scope.prefixes()),
                 }),
             )

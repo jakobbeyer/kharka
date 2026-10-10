@@ -1,0 +1,48 @@
+[package]
+name = "kharka-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+kharka = { path = ".." }
+libfuzzer-sys = "0.4"
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+tempfile = "3.27.0"
+tokio = { version = "1.53.2", features = ["rt"] }
+tokio-util = { version = "0.7.20", features = ["codec"] }
+
+# its own workspace: the main package neither builds nor tests the fuzz targets
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "frame"
+path = "fuzz_targets/frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "entry"
+path = "fuzz_targets/entry.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "schema"
+path = "fuzz_targets/schema.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "storage"
+path = "fuzz_targets/storage.rs"
+test = false
+doc = false
+bench = false

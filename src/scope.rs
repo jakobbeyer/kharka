@@ -6,6 +6,7 @@ use std::fmt;
 
 use crate::entry::check_prefix;
 
+/// The key prefixes a daemon syncs; no prefixes at all means everything.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Scope {
     /// Sorted, without duplicates; empty: everything.
@@ -13,6 +14,7 @@ pub struct Scope {
 }
 
 impl Scope {
+    /// The scope that holds every key.
     pub fn everything() -> Scope {
         Scope::default()
     }
@@ -31,10 +33,12 @@ impl Scope {
         Ok(Scope { prefixes })
     }
 
+    /// The synced prefixes, sorted; empty for everything.
     pub fn prefixes(&self) -> &[String] {
         &self.prefixes
     }
 
+    /// Whether nothing is left out.
     pub fn is_everything(&self) -> bool {
         self.prefixes.is_empty()
     }

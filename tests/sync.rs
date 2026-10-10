@@ -1,5 +1,6 @@
 //! A hub and daemons: changes travel, offline writes arrive later, the latest write wins, a hub that lost its data is
-//! filled again, and the ssh transport works through `kharka bridge`.
+//! filled again, the ssh transport works through `kharka bridge`, a stamp from the future is refused (and does not hold
+//! up later writes), and a daemon too slow for the stream is caught up from the log.
 
 mod common;
 
@@ -9,7 +10,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Stdio;
 
 use common::*;
-use serde_json::Value;
+use kharka::entry::Entry;
+use kharka::hlc::{Hlc, wall_ms};
+use kharka::store::{Options, Store};
+use serde_json::{Value, json};
 
 fn hub_target(dir: &std::path::Path) -> String {
     hub_socket(dir).display().to_string()
@@ -199,5 +203,124 @@ fn through_ssh_and_the_bridge() {
         started.elapsed() < std::time::Duration::from_secs(5),
         "took {:?}",
         started.elapsed()
+    );
+}
+
+#[test]
+fn a_write_stamped_far_ahead_of_the_hub_is_refused_and_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir = dir.path();
+    let hub = start_hub(dir);
+    let target = hub_target(dir);
+    let _b = start_daemon(dir, "b", Some(&target));
+    // a's replica, made beforehand: it holds a write a made while its clock was ten minutes ahead (put into the log as
+    // a write lands there, pending)
+    let ahead = Hlc {
+        wall_ms: wall_ms() + 10 * 60 * 1000,
+        counter: 0,
+        node: "a".into(),
+    };
+    {
+        let mut store = Store::open(&dir.join("a"), "a", Options::default()).unwrap();
+        let written = Entry::new("tasks/ahead", Some(json!("ahead")), ahead.clone());
+        store.from_hub(written).unwrap();
+        assert_eq!(store.pending().len(), 1);
+    }
+    let a = start_daemon(dir, "a", Some(&target));
+
+    // kept on the hub under _rejected/, answered with `rejected`
+    let record_key = format!("_rejected/a/{}-{}", ahead.wall_ms, ahead.counter);
+    wait_until("the record of the refused write reached a", || {
+        get(dir, "a", &record_key).is_some()
+    });
+    let record: Value = serde_json::from_str(&get(dir, "b", &record_key).unwrap()).unwrap();
+    assert_eq!(record["key"], "tasks/ahead");
+    assert_eq!(record["value"], "ahead");
+    assert_eq!(record["hlc"], ahead.to_string());
+    assert!(
+        record["reason"].as_str().unwrap().contains("five minutes ahead"),
+        "{record}"
+    );
+    wait_until("a got the answer", || {
+        a.log().contains("the hub did not take tasks/ahead")
+    });
+    // not restated: a restatement comes with the record and would replace a's version; a keeps it, but no longer
+    // pushes it
+    assert_eq!(get(dir, "a", "tasks/ahead").as_deref(), Some(r#""ahead""#));
+    assert_eq!(get(dir, "b", "tasks/ahead"), None);
+    let before = status(dir, "a");
+    assert_eq!(
+        (before["refused"].as_u64(), before["pending"].as_u64()),
+        (Some(1), Some(0))
+    );
+
+    // nor after a restart; and a's clock did not follow that stamp: its next write is one the hub takes
+    drop(a);
+    let a = start_daemon(dir, "a", Some(&target));
+    wait_until("a synced", || synced(dir, "a"));
+    put(dir, "a", "tasks/next", "1");
+    wait_until("b has a's next write", || {
+        get(dir, "b", "tasks/next").as_deref() == Some("1")
+    });
+    assert_eq!(
+        hub.log().matches("refused tasks/ahead from a").count(),
+        1,
+        "{}",
+        hub.log()
+    );
+
+    // a write to the key replaces the version too far ahead, on a and everywhere, also after a restart
+    put(dir, "a", "tasks/ahead", r#""again""#);
+    assert_eq!(get(dir, "a", "tasks/ahead").as_deref(), Some(r#""again""#));
+    wait_until("b has it", || {
+        get(dir, "b", "tasks/ahead").as_deref() == Some(r#""again""#)
+    });
+    wait_until("a counts nothing refused or pending", || {
+        let now = status(dir, "a");
+        (now["refused"].as_u64(), now["pending"].as_u64()) == (Some(0), Some(0))
+    });
+    drop(a);
+    let _a = start_daemon(dir, "a", Some(&target));
+    wait_until("a synced", || synced(dir, "a"));
+    assert_eq!(get(dir, "a", "tasks/ahead").as_deref(), Some(r#""again""#));
+    let after = status(dir, "a");
+    assert_eq!(
+        (after["refused"].as_u64(), after["pending"].as_u64()),
+        (Some(0), Some(0))
+    );
+    assert_eq!(hub.log().matches("refused").count(), 1, "{}", hub.log());
+}
+
+#[test]
+fn a_daemon_behind_the_stream_is_caught_up_from_the_log() {
+    // more than the 4096 changes a connection may fall behind (BACKLOG in src/hub.rs), pushed at once
+    const WRITES: u64 = 6000;
+    let dir = tempfile::tempdir().unwrap();
+    let dir = dir.path();
+    {
+        let options = Options {
+            sync: false,
+            ..Options::default()
+        };
+        let mut store = Store::open(&dir.join("b"), "b", options).unwrap();
+        for n in 0..WRITES {
+            store.put(&format!("bulk/{n}"), json!(n), None).unwrap();
+        }
+    }
+    let hub = start_hub(dir);
+    let target = hub_target(dir);
+    let _a = start_daemon(dir, "a", Some(&target));
+    wait_until("a synced", || synced(dir, "a"));
+    let _b = start_daemon(dir, "b", Some(&target));
+
+    wait_until("a has every entry", || {
+        status(dir, "a")["entries"].as_u64() == Some(WRITES + 2)
+    });
+    assert!(hub.log().contains("a fell"), "{}", hub.log());
+    wait_until("b's writes are all confirmed", || status(dir, "b")["pending"] == 0);
+    assert_eq!(get(dir, "a", "bulk/0").as_deref(), Some("0"));
+    assert_eq!(
+        get(dir, "a", &format!("bulk/{}", WRITES - 1)),
+        Some((WRITES - 1).to_string())
     );
 }

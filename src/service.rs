@@ -6,11 +6,14 @@ use std::path::Path;
 /// What the service file is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum System {
+    /// A launchd agent, a property list in `~/Library/LaunchAgents`.
     Launchd,
+    /// A systemd user unit in `~/.config/systemd/user`.
     Systemd,
 }
 
 impl System {
+    /// The service system of the machine this runs on: launchd on macOS, else systemd.
     pub fn here() -> System {
         if cfg!(target_os = "macos") {
             System::Launchd
@@ -46,6 +49,7 @@ pub fn instructions(system: System, role: &str) -> String {
     }
 }
 
+/// The launchd label of the agent that runs a role.
 pub fn label(role: &str) -> String {
     format!("dev.kharka.{role}")
 }

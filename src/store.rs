@@ -13,7 +13,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::entry::{Entry, MAX_VALUE, check_key, check_writable};
-use crate::hlc::{Clock, Hlc};
+use crate::hlc::{Clock, Hlc, wall_ms};
 use crate::storage::{LogStorage, Storage};
 
 pub struct Options {
@@ -42,6 +42,12 @@ pub enum Error {
     Conflict {
         current: Option<Hlc>,
     },
+    /// A local write to a key whose entry is stamped too far ahead of this clock, and is not this node's own pending
+    /// one: last writer wins would keep that entry everywhere.
+    Ahead {
+        key: String,
+        hlc: Hlc,
+    },
     Io(io::Error),
 }
 
@@ -51,6 +57,7 @@ impl Error {
         match self {
             Error::Invalid(_) => "invalid",
             Error::Conflict { .. } => "conflict",
+            Error::Ahead { .. } => "ahead",
             Error::Io(_) => "io",
         }
     }
@@ -62,6 +69,11 @@ impl fmt::Display for Error {
             Error::Invalid(message) => f.write_str(message),
             Error::Conflict { current: Some(hlc) } => write!(f, "changed meanwhile, now at {hlc}"),
             Error::Conflict { current: None } => f.write_str("changed meanwhile, the key does not exist now"),
+            Error::Ahead { key, hlc } => write!(
+                f,
+                "{key} holds a write stamped {hlc}, more than five minutes ahead of this clock; it can be written \
+                 again once the clock catches up"
+            ),
             Error::Io(err) => write!(f, "storage: {err}"),
         }
     }
@@ -108,8 +120,9 @@ impl Store {
             batch: None,
             batch_seq: 0,
         };
+        let now = wall_ms();
         for entry in loaded {
-            store.clock.observe(&entry.hlc);
+            store.clock.observe_at(&entry.hlc, now);
             store.insert(entry);
         }
         store.maybe_compact();
@@ -160,8 +173,28 @@ impl Store {
         self.entries.values().filter(|entry| !entry.deleted).count()
     }
 
-    pub fn tick(&mut self) -> Hlc {
-        self.clock.tick()
+    /// The stamp of a write of this node to `key`: after every stamp seen, the held entry's included (unless it is too
+    /// far ahead, which the clock does not follow).
+    pub fn stamp(&mut self, key: &str) -> Hlc {
+        self.stamp_at(key, wall_ms())
+    }
+
+    fn stamp_at(&mut self, key: &str, now: u64) -> Hlc {
+        if let Some(held) = self.entries.get(key) {
+            self.clock.observe_at(&held.hlc, now);
+        }
+        self.clock.tick_at(now)
+    }
+
+    /// The stamp of a write of the hub to a key it decides itself (`_nodes/`, protected collections, settings, a
+    /// restatement): after the held entry, however far ahead that one is, so the write always wins. The clock does not
+    /// follow it; the daemons take the entry from the hub, which checks no drift of its own writes.
+    pub fn stamp_over(&mut self, key: &str) -> Hlc {
+        let hlc = self.stamp(key);
+        match self.entries.get(key) {
+            Some(held) if held.hlc >= hlc => held.hlc.after(&hlc.node),
+            _ => hlc,
+        }
     }
 
     pub fn observe(&mut self, hlc: &Hlc) {
@@ -192,9 +225,7 @@ impl Store {
         check_writable(key).map_err(Error::Invalid)?;
         check_size(&value)?;
         self.check_if(key, if_hlc)?;
-        let entry = Entry::new(key, Some(value), self.clock.tick());
-        self.write(entry.clone())?;
-        Ok(entry)
+        self.write_local(key, Some(value))
     }
 
     /// A write of kharka's own keys (`_collections/…`, clearing `_rejected/…`), checked by the caller: a value, or a
@@ -204,9 +235,7 @@ impl Store {
         if let Some(value) = &value {
             check_size(value)?;
         }
-        let entry = Entry::new(key, value, self.clock.tick());
-        self.write(entry.clone())?;
-        Ok(entry)
+        self.write_local(key, value)
     }
 
     /// A tool's deletion: a tombstone, or nothing when the key has no live entry.
@@ -216,9 +245,7 @@ impl Store {
         if self.get(key).is_none() {
             return Ok(None);
         }
-        let entry = Entry::new(key, None, self.clock.tick());
-        self.write(entry.clone())?;
-        Ok(Some(entry))
+        self.write_local(key, None).map(Some)
     }
 
     // ── the replica's side ──
@@ -348,6 +375,49 @@ impl Store {
 
     // ── inside ──
 
+    /// A write of this node (never inside a batch). The clock does not follow a stamp too far ahead of it (see
+    /// `Clock::observe_at`), so a held entry stamped like that would win over the write, by last writer wins, here and on
+    /// the hub. When it is this node's own and the hub never confirmed it (a write made while this clock was wrong,
+    /// pending or refused by the hub), the write replaces it all the same: the hub decides by last writer wins as
+    /// always, takes this write if it never took the old one, and otherwise answers with the old one, which this
+    /// replica takes back. Any other such entry refuses the write, until the wall clock catches up.
+    fn write_local(&mut self, key: &str, value: Option<Value>) -> Result<Entry, Error> {
+        // one reading of the clock: a clock stepping back between two would let the write sort before the held entry
+        let now = wall_ms();
+        let over_own = match self.entries.get(key) {
+            Some(held) if held.hlc.too_far_ahead(now) => {
+                if held.hlc.node != self.clock.node() || held.seq > 0 {
+                    return Err(Error::Ahead {
+                        key: key.to_string(),
+                        hlc: held.hlc.clone(),
+                    });
+                }
+                true
+            }
+            _ => false,
+        };
+        let entry = Entry::new(key, value, self.stamp_at(key, now));
+        if over_own {
+            self.replace(entry.clone())?;
+        } else {
+            self.write(entry.clone())?;
+        }
+        Ok(entry)
+    }
+
+    /// Puts a write in place of a later pending entry. Loading the log would keep the later one, so the store is
+    /// compacted at once instead of appending: the snapshot holds the write, before it is answered.
+    fn replace(&mut self, entry: Entry) -> io::Result<()> {
+        let replaced = self.entries.insert(entry.key.clone(), entry);
+        let compacted = self.storage.compact(&mut self.entries.values());
+        if compacted.is_err()
+            && let Some(replaced) = replaced
+        {
+            self.entries.insert(replaced.key.clone(), replaced);
+        }
+        compacted
+    }
+
     fn check_if(&self, key: &str, if_hlc: Option<&Hlc>) -> Result<(), Error> {
         let Some(expected) = if_hlc else { return Ok(()) };
         let current = self.get(key).map(|entry| &entry.hlc);
@@ -426,6 +496,7 @@ fn check_size(value: &Value) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hlc::MAX_DRIFT_MS;
     use serde_json::json;
 
     fn open(dir: &Path, node: &str) -> Store {
@@ -488,7 +559,10 @@ mod tests {
         store.put("a", json!(1), None).unwrap();
         store.delete("a", None).unwrap();
         store.put("b", json!(2), None).unwrap();
-        let future = remote("c", json!(3), "99999999999999-0-other", 7);
+        let future = Entry {
+            seq: 7,
+            ..Entry::new("c", Some(json!(3)), ahead(60_000, "other"))
+        };
         store.from_hub(future.clone()).unwrap();
         drop(store);
         let mut store = open(dir.path(), "n");
@@ -741,5 +815,97 @@ mod tests {
         assert_eq!(feed, [("b".to_string(), 2), ("a".to_string(), 3)]);
         assert_eq!(hub.since(2).len(), 1);
         assert!(hub.since(3).is_empty());
+    }
+
+    /// A stamp `ms` ahead of the wall clock.
+    fn ahead(ms: u64, node: &str) -> Hlc {
+        Hlc {
+            wall_ms: wall_ms() + ms,
+            counter: 0,
+            node: node.into(),
+        }
+    }
+
+    #[test]
+    fn an_own_pending_write_stamped_too_far_ahead_is_replaced_by_the_next() {
+        let dir = tempfile::tempdir().unwrap();
+        let far = ahead(MAX_DRIFT_MS + 60_000, "n");
+        let last: Hlc = format!("{}-{}-n", u64::MAX, u32::MAX).parse().unwrap();
+        {
+            // written while this machine's clock was ahead, and a damaged record with the largest stamp there is
+            let mut store = open(dir.path(), "n");
+            store
+                .write(Entry::new("k/ahead", Some(json!("ahead")), far.clone()))
+                .unwrap();
+            store
+                .write(Entry::new("k/last", Some(json!("last")), last.clone()))
+                .unwrap();
+        }
+        let mut store = open(dir.path(), "n");
+        // the clock did not follow them: its writes are ones the hub takes
+        let other = store.put("k/other", json!(1), None).unwrap().hlc;
+        assert!(!other.too_far_ahead(wall_ms()));
+        // a write to their keys replaces them, stamped by this clock all the same
+        let written = store.put("k/ahead", json!("now"), None).unwrap().hlc;
+        assert!(written > other && written < far);
+        let deleted = store.delete("k/last", None).unwrap().unwrap().hlc;
+        assert!(deleted > written && deleted < last);
+        assert_eq!(store.get("k/ahead").unwrap().value, json!("now"));
+        assert!(store.held("k/last").unwrap().deleted);
+        let pending: Vec<_> = store.pending().into_iter().map(|entry| entry.hlc).collect();
+        assert_eq!(pending, [other, written, deleted.clone()]);
+        // for good: loading again does not bring them back
+        drop(store);
+        let store = open(dir.path(), "n");
+        assert_eq!(store.get("k/ahead").unwrap().value, json!("now"));
+        assert_eq!(store.held("k/last").unwrap().hlc, deleted);
+    }
+
+    #[test]
+    fn a_write_over_another_entry_stamped_too_far_ahead_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open(dir.path(), "n");
+        let theirs = ahead(MAX_DRIFT_MS + 60_000, "other");
+        store
+            .from_hub(remote("k/theirs", json!(1), &theirs.to_string(), 1))
+            .unwrap();
+        // this node's own, but confirmed: the hub has it, a write with an earlier stamp would lose there
+        let confirmed = ahead(MAX_DRIFT_MS + 60_000, "n");
+        store
+            .from_hub(remote("k/confirmed", json!(2), &confirmed.to_string(), 2))
+            .unwrap();
+        for (key, hlc) in [("k/theirs", &theirs), ("k/confirmed", &confirmed)] {
+            let refused = store.put(key, json!(3), None).unwrap_err();
+            assert!(matches!(&refused, Error::Ahead { key: k, hlc: h } if k == key && h == hlc));
+            assert_eq!(refused.code(), "ahead");
+            assert!(refused.to_string().contains("once the clock catches up"), "{refused}");
+            assert!(matches!(store.delete(key, None), Err(Error::Ahead { .. })));
+        }
+        assert!(store.pending().is_empty());
+        // within the limit, the write stamps after it as always
+        let near = ahead(60_000, "other");
+        store
+            .from_hub(remote("k/near", json!(4), &near.to_string(), 3))
+            .unwrap();
+        assert!(store.put("k/near", json!(5), None).unwrap().hlc > near);
+    }
+
+    #[test]
+    fn the_hubs_own_write_wins_over_an_entry_stamped_too_far_ahead() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open(dir.path(), "hub");
+        let far = ahead(MAX_DRIFT_MS + 60_000, "hub");
+        store
+            .accept(remote("_nodes/a", json!({"online": true}), &far.to_string(), 0))
+            .unwrap();
+        let hlc = store.stamp_over("_nodes/a");
+        assert_eq!(hlc, far.after("hub"));
+        let (held, changed) = store
+            .accept(Entry::new("_nodes/a", Some(json!({"online": false})), hlc))
+            .unwrap();
+        assert!(changed);
+        assert_eq!(held.value, json!({"online": false}));
+        // the clock did not follow: other keys are stamped by the wall clock
+        assert!(!store.stamp_over("_nodes/b").too_far_ahead(wall_ms()));
     }
 }

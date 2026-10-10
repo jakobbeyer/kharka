@@ -1,10 +1,26 @@
 [package]
 name = "kharka"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
 description = "A small local-first JSON store: every machine keeps a full replica, one hub orders and spreads the changes"
 license = "MIT"
 repository = "https://github.com/jakobbeyer/kharka"
+homepage = "https://github.com/jakobbeyer/kharka"
+readme = "README.md"
+rust-version = "1.89"
+include = [
+    "/src/**",
+    "/tests/**",
+    "/docs/**",
+    "/contrib/**",
+    "/README.md",
+    "/LICENSE",
+    "/CHANGELOG.md",
+    "/SECURITY.md",
+    "/CONTRIBUTING.md",
+    "/Cargo.toml",
+    "/Cargo.lock",
+]
 keywords = ["local-first", "sync", "replication", "database", "json"]
 categories = ["database", "command-line-utilities"]
 
@@ -12,6 +28,8 @@ categories = ["database", "command-line-utilities"]
 anyhow = "1.0.104"
 bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive", "env"] }
+clap_complete = "4.6.11"
+clap_mangen = "0.3.3"
 crc32fast = "1.5.2"
 futures-util = { version = "0.3.34", features = ["sink"] }
 gethostname = "1.1.0"
@@ -22,4 +40,10 @@ tokio-util = { version = "0.7.20", features = ["codec"] }
 toml = "1.1.8"
 
 [dev-dependencies]
+proptest = "1.11.0"
 tempfile = "3.27.0"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

@@ -3,12 +3,15 @@
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::Context;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 use serde_json::{Value, json};
 
 use kharka::client::Client;
+use kharka::hub::Heartbeat;
 use kharka::schema::Collections;
 use kharka::scope::Scope;
 use kharka::sync::HubTarget;
@@ -47,6 +50,9 @@ enum Command {
         /// Sync only the keys under these prefixes, e.g. tasks/,status/ [default: everything]
         #[arg(long, env = "KHARKA_SYNC", value_delimiter = ',')]
         sync: Vec<String>,
+        /// Only for tests: a ping interval in milliseconds, for the silence limit of three
+        #[arg(long, hide = true, value_parser = clap::value_parser!(u64).range(1..))]
+        heartbeat_ms: Option<u64>,
     },
     /// Run the hub that every daemon syncs with
     Serve {
@@ -62,14 +68,19 @@ enum Command {
         /// The hub's socket [default: hub.sock next to the daemon's]
         #[arg(long, env = "KHARKA_HUB_SOCKET")]
         hub_socket: Option<PathBuf>,
+        /// Only for tests: a ping interval in milliseconds, for the silence limit of three
+        #[arg(long, hide = true, value_parser = clap::value_parser!(u64).range(1..))]
+        heartbeat_ms: Option<u64>,
     },
     /// Connect stdin and stdout to the hub's socket (what ssh runs on the hub's machine)
     Bridge {
+        /// The hub's socket [default: hub.sock next to the daemon's]
         #[arg(long, env = "KHARKA_HUB_SOCKET")]
         hub_socket: Option<PathBuf>,
     },
     /// Print a value (exit 3 when the key does not exist)
     Get {
+        /// The key, e.g. tasks/1
         key: String,
         /// The whole entry: value, stamp, sequence number
         #[arg(long)]
@@ -77,6 +88,7 @@ enum Command {
     },
     /// Write a value and print its stamp
     Put {
+        /// The key, e.g. tasks/1
         key: String,
         /// JSON, or - to read it from stdin
         value: String,
@@ -86,6 +98,7 @@ enum Command {
     },
     /// Delete a key
     Del {
+        /// The key, e.g. tasks/1
         key: String,
         /// Only if the key still has this stamp (exit 4 otherwise)
         #[arg(long)]
@@ -93,7 +106,8 @@ enum Command {
     },
     /// List the keys under a prefix
     Ls {
-        #[arg(default_value = "")]
+        /// Only keys starting with this, e.g. tasks/ [default: all]
+        #[arg(default_value = "", hide_default_value = true)]
         prefix: String,
         /// The entries as JSON lines instead of the keys
         #[arg(long)]
@@ -101,7 +115,8 @@ enum Command {
     },
     /// Print every change under a prefix as a JSON line, until interrupted
     Watch {
-        #[arg(default_value = "")]
+        /// Only keys starting with this, e.g. tasks/ [default: all]
+        #[arg(default_value = "", hide_default_value = true)]
         prefix: String,
         /// Start with the current entries, then a `ready` line
         #[arg(long)]
@@ -132,20 +147,30 @@ enum Command {
     ///
     /// The arguments after the role are passed on, e.g. `kharka service daemon --hub server`.
     Service {
+        /// What to keep running
         #[arg(value_parser = ["daemon", "serve"])]
         role: String,
         /// Write for this system instead of the one here
         #[arg(long, value_parser = ["launchd", "systemd"])]
         system: Option<String>,
+        /// Arguments for the role, e.g. --hub server
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Print a completion script for a shell
+    Completions {
+        /// The shell to write for
+        shell: Shell,
+    },
+    /// Print the man page (roff)
+    Man,
 }
 
 #[derive(Subcommand)]
 enum CollectionsAction {
     /// Define or change a collection of your own (a protected one only changes in the hub's kharka.toml)
     Set {
+        /// The collection's name, the first segment of its keys: tasks for tasks/…
         name: String,
         /// record: any machine writes, the latest write wins; state: each machine writes only NAME/<node>/…
         #[arg(long, default_value = "record", value_parser = ["record", "state"])]
@@ -158,7 +183,10 @@ enum CollectionsAction {
         schema: Option<String>,
     },
     /// Remove a collection of your own; its data stays
-    Rm { name: String },
+    Rm {
+        /// The collection to remove
+        name: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -172,6 +200,11 @@ fn main() -> ExitCode {
     }
 }
 
+/// The heartbeat of `--heartbeat-ms`, or the default.
+fn heartbeat(ms: Option<u64>) -> Heartbeat {
+    ms.map_or_else(Heartbeat::default, |ms| Heartbeat::every(Duration::from_millis(ms)))
+}
+
 fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     // the daemon listens at the default place; a client looks where a daemon of this user may listen
     let explicit = cli.socket;
@@ -183,6 +216,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             hub,
             config,
             sync,
+            heartbeat_ms,
         } => {
             let node = node.unwrap_or_else(paths::node);
             entry::check_node(&node).map_err(anyhow::Error::msg)?;
@@ -197,6 +231,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     .map_err(anyhow::Error::msg)?,
                 config: Some(config.unwrap_or_else(paths::config)),
                 sync: Scope::of(sync).map_err(anyhow::Error::msg)?,
+                heartbeat: heartbeat(heartbeat_ms),
             };
             runtime()?.block_on(daemon::run(options, shutdown()))?;
         }
@@ -205,12 +240,14 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             node,
             config,
             hub_socket,
+            heartbeat_ms,
         } => {
             let options = hub::Options {
                 socket: hub_socket.unwrap_or_else(paths::hub_socket),
                 data: data.unwrap_or_else(paths::hub_data),
                 node,
                 config: Some(config.unwrap_or_else(paths::config)),
+                heartbeat: heartbeat(heartbeat_ms),
             };
             runtime()?.block_on(hub::run(options, shutdown()))?;
         }
@@ -235,6 +272,10 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             print!("{}", service::file(system, &exe, &role, &args, &log));
             eprintln!("Install it:\n{}", service::instructions(system, &role));
         }
+        Command::Completions { shell } => {
+            clap_complete::generate(shell, &mut Cli::command(), "kharka", &mut io::stdout());
+        }
+        Command::Man => man_page(&mut io::stdout().lock())?,
         Command::Collections {
             check: Some(file),
             action: None,
@@ -432,11 +473,60 @@ fn client_command(socket: &std::path::Path, command: Command) -> anyhow::Result<
                 }
             }
         }
-        Command::Daemon { .. } | Command::Serve { .. } | Command::Bridge { .. } | Command::Service { .. } => {
+        Command::Daemon { .. }
+        | Command::Serve { .. }
+        | Command::Bridge { .. }
+        | Command::Service { .. }
+        | Command::Completions { .. }
+        | Command::Man => {
             unreachable!("handled in run")
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// The man page: the program's page, then a section that describes every command (one page, not one per command).
+fn man_page(out: &mut impl Write) -> io::Result<()> {
+    let mut cmd = Cli::command();
+    cmd.build();
+    let man = clap_mangen::Man::new(cmd.clone());
+    man.render_title(out)?;
+    man.render_name_section(out)?;
+    man.render_synopsis_section(out)?;
+    man.render_description_section(out)?;
+    man.render_options_section(out)?;
+    writeln!(out, ".SH COMMANDS")?;
+    man_commands(out, &cmd, "kharka")?;
+    man.render_version_section(out)
+}
+
+/// The subsections for the commands below `parent`, each followed by its own subcommands (`collections set`).
+fn man_commands(out: &mut impl Write, parent: &clap::Command, name: &str) -> io::Result<()> {
+    for sub in parent.get_subcommands().filter(|sub| sub.get_name() != "help") {
+        let name = format!("{name} {}", sub.get_name());
+        writeln!(out, ".SS \"{name}\"")?;
+        // --socket and --help are described once, above
+        let page = sub
+            .clone()
+            .bin_name(&name)
+            .mut_arg("socket", |arg| arg.hide(true))
+            .mut_arg("help", |arg| arg.hide(true));
+        let man = clap_mangen::Man::new(page);
+        let mut text = vec![];
+        man.render_description_section(&mut text)?;
+        text.extend_from_slice(b".PP\n");
+        man.render_synopsis_section(&mut text)?;
+        man.render_options_section(&mut text)?;
+        // the headings of the whole page are not repeated, only their text
+        for line in String::from_utf8_lossy(&text)
+            .lines()
+            .filter(|line| !line.starts_with(".SH "))
+        {
+            writeln!(out, "{line}")?;
+        }
+        man_commands(out, sub, &name)?;
+    }
+    Ok(())
 }
 
 /// A refused request: its message, exit 4 for a conflict, else 1.

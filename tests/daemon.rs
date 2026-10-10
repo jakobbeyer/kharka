@@ -2,8 +2,11 @@
 
 mod common;
 
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::process::Stdio;
 
 use common::*;
@@ -204,6 +207,44 @@ fn one_daemon_per_socket_and_folder() {
         "{}",
         stderr(&other_socket)
     );
+}
+
+#[test]
+fn a_socket_in_a_folder_of_ones_own_leaves_it_as_it_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir = dir.path();
+    let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    let daemon = |node: &str, socket: &Path| {
+        let mut command = kharka(dir);
+        command
+            .args(["daemon", "--node", node, "--data"])
+            .arg(dir.join(node))
+            .arg("--socket")
+            .arg(socket);
+        let daemon = Process::start(dir, node, &mut command);
+        wait_for_socket(socket);
+        daemon
+    };
+    let shared = dir.join("shared");
+    fs::create_dir(&shared).unwrap();
+    fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).unwrap();
+    let _a = daemon("a", &shared.join("a.sock"));
+    assert_eq!(mode(&shared), 0o755);
+    assert_eq!(mode(&shared.join("a.sock")), 0o600);
+    // the socket works, and nothing of the staging is left in the folder
+    let sock = shared.join("a.sock");
+    let through = |args: &[&str]| {
+        let mut command = kharka(dir);
+        command.arg("--socket").arg(&sock).args(args);
+        command.output().unwrap()
+    };
+    assert!(through(&["put", "k", "1"]).status.success());
+    assert_eq!(stdout(&through(&["get", "k"])), "1");
+    let left: Vec<_> = fs::read_dir(&shared).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(left, ["a.sock"]);
+    // a folder the daemon creates is its own
+    let _b = daemon("b", &dir.join("new/b.sock"));
+    assert_eq!(mode(&dir.join("new")), 0o700);
 }
 
 #[test]

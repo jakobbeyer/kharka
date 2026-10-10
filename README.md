@@ -26,13 +26,23 @@ each one takes a full copy home.
 - **No database underneath:** an append-only log with checksums and snapshots, by hand. ssh is the transport and the
   authentication; the hub opens no port.
 
-**Status:** young. Storage, daemon, hub and sync work and are tested; the protocol may still change. How it works:
-[docs/design.md](docs/design.md); how programs talk to it: [docs/protocol.md](docs/protocol.md).
+**Status:** young (0.x). Storage, daemon, hub and sync work and are tested; before 1.0 a minor release may still
+change the protocol or the on-disk format, and [the changelog](CHANGELOG.md) says when it does. macOS and Linux only.
+How it works: [docs/design.md](docs/design.md); how programs talk to it: [docs/protocol.md](docs/protocol.md).
 
 ## Install
 
+A prebuilt binary (macOS and Linux, arm64 and x86_64; the Linux builds are static):
+
 ```sh
-cargo install --git https://github.com/jakobbeyer/kharka
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/jakobbeyer/kharka/releases/latest/download/kharka-installer.sh | sh
+```
+
+With Homebrew, or from source (Rust 1.89 or newer):
+
+```sh
+brew install jakobbeyer/tap/kharka
+cargo install kharka
 ```
 
 On every machine; the hub's machine needs it for `kharka serve` and for `kharka bridge`, which ssh runs there.
@@ -90,6 +100,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.kharka.daemon.plist
 | `kharka collections rm NAME` | removes a collection of your own (its data stays) |
 | `kharka collections --check FILE` | checks a kharka.toml and its schemas, without a daemon |
 | `kharka service ROLE [ARGS]` | prints a service file for `daemon` or `serve` |
+| `kharka completions SHELL`, `kharka man` | print a shell completion script; the man page |
 
 Exit codes: `0` ok, `1` error, `2` usage, `3` not found (`get`, `del`, `collections rm`), `4` conflict (`--if-hlc`).
 
@@ -139,6 +150,39 @@ A write the hub refuses (say, made offline under an older schema) is not lost: i
 `kharka daemon --sync tasks/,status/` keeps only the keys under these prefixes on this machine; the hub sends nothing
 else to it. Reading or writing other keys there is refused (`not synced`). Changing `--sync` and restarting removes what
 is no longer synced and fetches what newly is.
+
+## Shell completions and man page
+
+Both are printed to stdout:
+
+```sh
+kharka completions zsh > ~/.zfunc/_kharka          # a folder on your $fpath
+kharka completions bash > ~/.local/share/bash-completion/completions/kharka
+kharka completions fish > ~/.config/fish/completions/kharka.fish
+kharka man > ~/.local/share/man/man1/kharka.1
+```
+
+## When kharka fits
+
+kharka is for a handful of machines that share small JSON documents and keep working apart: what each machine reports
+about itself (a status, the agents running on it), shared tasks, settings. Every machine has everything, every change
+arrives live.
+
+It is not the tool for files or large values (at most 1 MB per key), for queries beyond key prefixes, for machines that
+do not trust each other, or for many people editing the same record at once.
+
+**Known limits:**
+
+- Last writer wins per key: two offline edits of one record do not merge, the later one replaces the other.
+- Deleted keys stay as tombstones for good, so a store with many short-lived keys grows.
+- One hub: while it is away, every machine keeps working, but changes travel only when it is back.
+- Every node that reaches the hub is trusted ([SECURITY.md](SECURITY.md)).
+- About 100 durable writes a second per daemon on macOS (each one is synced to disk before it is answered).
+
+## Contributing
+
+Issues and pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). Report security problems privately, as
+[SECURITY.md](SECURITY.md) describes.
 
 ## License
 

@@ -8,6 +8,7 @@ use std::path::Path;
 use anyhow::{Context, bail};
 use serde_json::{Value, json};
 
+/// A connection to the daemon's socket. Requests and answers are JSON lines (docs/protocol.md).
 pub struct Client {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
@@ -15,6 +16,7 @@ pub struct Client {
 }
 
 impl Client {
+    /// Connects to the daemon listening at `socket`.
     pub fn connect(socket: &Path) -> anyhow::Result<Client> {
         let stream = UnixStream::connect(socket).with_context(|| {
             format!(

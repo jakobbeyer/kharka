@@ -1,5 +1,6 @@
 //! Recovery: a hub that lost its data or had its log cut is filled again without losing anyone's writes, a refused
-//! write too large to keep whole leaves the log readable, and a config file that is away for a moment changes nothing.
+//! write too large to keep whole leaves the log readable, files of an older format are taken over and those of a newer
+//! one or with a damaged header refused, and a config file that is away for a moment changes nothing.
 
 mod common;
 
@@ -79,6 +80,87 @@ fn a_cut_hub_log_starts_a_new_epoch_and_the_daemons_restore_it() {
     wait_until("a restored it", || synced(dir, "a"));
     let _b = start_daemon(dir, "b", Some(&target));
     wait_until("b gets what a still had", || get(dir, "b", "topics/kept").is_some());
+}
+
+/// A record as kharka wrote it before files had a header: length and CRC32 (both big-endian), then the entry as JSON.
+fn format_0_record(json: &str) -> Vec<u8> {
+    let mut record = (json.len() as u32).to_be_bytes().to_vec();
+    record.extend_from_slice(&crc32fast::hash(json.as_bytes()).to_be_bytes());
+    record.extend_from_slice(json.as_bytes());
+    record
+}
+
+#[test]
+fn a_hub_of_format_0_keeps_its_data_and_its_epoch() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir = dir.path();
+    let data = dir.join("hub");
+    fs::create_dir(&data).unwrap();
+    fs::write(data.join("epoch"), "00000000000000aa\n").unwrap();
+    fs::write(
+        data.join("snapshot"),
+        format_0_record(r#"{"key":"topics/old","value":"snapshot","hlc":"1700000000000-0-a","seq":1}"#),
+    )
+    .unwrap();
+    fs::write(
+        data.join("data.log"),
+        [
+            format_0_record(r#"{"key":"topics/new","value":"log","hlc":"1700000000001-0-a","seq":2}"#),
+            format_0_record(r#"{"key":"topics/old","deleted":true,"hlc":"1700000000002-0-a","seq":3}"#),
+        ]
+        .concat(),
+    )
+    .unwrap();
+
+    let hub = start_hub(dir);
+    let _b = start_daemon(dir, "b", Some(&hub_target(dir)));
+    wait_until("b synced", || synced(dir, "b"));
+    assert_eq!(get(dir, "b", "topics/new").as_deref(), Some(r#""log""#));
+    assert_eq!(get(dir, "b", "topics/old"), None, "the deletion in the log came along");
+    assert_eq!(fs::read_to_string(data.join("epoch")).unwrap(), "00000000000000aa\n");
+    for file in ["snapshot", "data.log"] {
+        assert!(
+            fs::read(data.join(file)).unwrap().starts_with(b"KHRK\0\0\0\x01"),
+            "{file}"
+        );
+    }
+    let log = hub.log();
+    assert!(log.contains("rewritten as format 1"), "{log}");
+    assert!(!log.contains("cut off") && !log.contains("new epoch"), "{log}");
+}
+
+#[test]
+fn a_hub_refuses_a_log_of_a_newer_format_or_a_damaged_header_and_leaves_it_alone() {
+    let refusals = [
+        (
+            &b"KHRK\0\0\0\x02"[..],
+            "written by a newer kharka, format 2; this one reads up to 1",
+        ),
+        (
+            b"KHRL\0\0\0\x01",
+            "starts with neither a header nor a record: damaged, or not a kharka file",
+        ),
+    ];
+    for (header, problem) in refusals {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        let data = dir.join("hub");
+        fs::create_dir(&data).unwrap();
+        let log = [header, b"records of whatever format"].concat();
+        fs::write(data.join("data.log"), &log).unwrap();
+        let refused = kharka(dir)
+            .arg("serve")
+            .arg("--data")
+            .arg(&data)
+            .arg("--hub-socket")
+            .arg(hub_socket(dir))
+            .output()
+            .unwrap();
+        assert!(!refused.status.success());
+        assert!(stderr(&refused).contains(problem), "{}", stderr(&refused));
+        assert_eq!(fs::read(data.join("data.log")).unwrap(), log);
+        assert!(!data.join("epoch").exists(), "no epoch, new or old");
+    }
 }
 
 #[test]

@@ -24,6 +24,7 @@ local; writes are pushed to the hub by the daemon, not by the program.
 |---|---|
 | `invalid` | not JSON, unknown `op`, a missing field, a bad key or prefix, a write the collections do not allow, a value over 1 MB |
 | `conflict` | `if_hlc` did not match; `current` holds the key's stamp now (null: the key has no value) |
+| `ahead` | the key holds an entry stamped more than five minutes ahead of this machine's clock (not one of its own pending writes): a write would lose to it; it can be written once the clock catches up |
 | `protected` | the collection comes from the hub's kharka.toml; only the file changes it |
 | `not_synced` | the key (or everything under the prefix) is not synced to this machine: see [scope](#scope) |
 | `io` | the daemon could not write to its disk |

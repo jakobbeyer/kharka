@@ -11,6 +11,7 @@ use crate::hlc::Hlc;
 
 /// Raised whenever a frame changes in a way an older peer cannot read.
 pub const PROTOCOL: u32 = 1;
+/// The largest frame, in bytes.
 pub const MAX_FRAME: usize = 8 << 20;
 /// Entries are sent in batches of about this many bytes.
 const BATCH_BYTES: usize = 1 << 20;
@@ -70,6 +71,7 @@ pub enum Frame {
 }
 
 impl Frame {
+    /// The frame's `type`, for logs and errors.
     pub fn name(&self) -> &'static str {
         match self {
             Frame::Hello { .. } => "hello",
@@ -85,10 +87,12 @@ impl Frame {
     }
 }
 
+/// The length-delimited codec both sides frame their streams with.
 pub fn codec() -> LengthDelimitedCodec {
     LengthDelimitedCodec::builder().max_frame_length(MAX_FRAME).new_codec()
 }
 
+/// Writes one frame.
 pub async fn send<W: AsyncWrite + Unpin>(
     writer: &mut FramedWrite<W, LengthDelimitedCodec>,
     frame: &Frame,

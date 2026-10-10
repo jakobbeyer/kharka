@@ -1,0 +1,53 @@
+name: Bug report
+description: Something does not work as documented
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: kharka version
+      description: Output of `kharka --version`.
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: macOS 15, Debian 12, ...
+    validations:
+      required: true
+  - type: dropdown
+    id: role
+    attributes:
+      label: Where it happens
+      multiple: true
+      options:
+        - daemon
+        - hub
+        - CLI
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you expected and what you got instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: textarea
+    id: status
+    attributes:
+      label: Output of `kharka status`
+      render: text
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Of the daemon or hub, around the problem. Remove anything private.
+      render: text

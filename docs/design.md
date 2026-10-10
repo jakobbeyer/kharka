@@ -105,10 +105,22 @@ are ignored, as JSON Schema ignores unknown ones. The daemon checks every write 
 **Hybrid logical clock.** A node stamps a write with `max(its wall clock, the largest stamp it has seen)`, and counts up
 when that does not move. Compared as `(wall ms, counter, node)`, stamps put every write in one total order that respects
 causality (a write made after seeing another always wins over it) and does not depend on two machines' clocks agreeing.
-A loaded replica observes every stamp it holds, so a write after a restart still sorts after everything before it.
+A loaded replica observes every stamp it holds (except those too far ahead, below), so a write after a restart still
+sorts after everything before it.
 
 **Last writer wins, per key.** An entry replaces the held one when its stamp is greater. Every replica and the hub apply
 the same rule, so they converge on the same value whatever order the writes arrive in.
+
+**Stamps too far ahead.** A clock does not follow a stamp more than five minutes ahead of its wall clock (written while
+a clock was wrong, or a damaged record): every later write would be stamped too far ahead for the hub, which refuses
+them. Merging stays last writer wins, so such an entry still wins over later writes with earlier stamps. A local write
+to its key therefore replaces it only when it is the node's own write the hub never confirmed (pending, or refused by
+the hub): the store is compacted at once, so a later load does not bring the old entry back, and the hub decides as
+always, taking the new write if it never took the old one. Any other such entry refuses a local write (`ahead`) until
+the wall clock catches up. The hub's own writes (`_nodes/`, protected collections, settings, restatements) are stamped
+right after the held entry, however far ahead, since no one else writes those keys. A limit: after a reset a node no
+longer knows which of its own far-ahead writes the old hub took, so a write over one of them can differ from a replica
+that holds it, until the key is written past its stamp.
 
 ## Sync protocol
 
@@ -123,7 +135,7 @@ hub → daemon   caught_up  { seq }
 daemon → hub   push       { entries, restore? }                 everything still pending, then every local write
 hub → daemon   changes    { entries }                           live: every entry the hub keeps, to every daemon
 hub → daemon   rejected   { key, hlc, reason, restated }        a pushed entry the hub did not take
-both ways      ping, pong                                       every 15 s: the connection is alive
+both ways      ping, pong                                       the hub pings every 15 s: the connection is alive
 ```
 
 The protocol version is 1; a hub refuses a daemon with another one.
@@ -152,7 +164,7 @@ The protocol version is 1; a hub refuses a daemon with another one.
 - **Refusals:** the hub refuses a pushed entry with an invalid key, a `_` key other than an own collection or the
   clearing of a `_rejected/` record, a change to a protected collection, an invalid collection definition, a stamp by
   another node than the sender, a value over 1 MB, one the collections do not allow, or a stamp more than five minutes
-  ahead of its clock. It keeps the refused write as `_rejected/<node>/<wall ms>-<counter>` = `{key, value, deleted, hlc,
+  ahead of its clock (such a write stays in the sender's replica until the key is written again there). It keeps the refused write as `_rejected/<node>/<wall ms>-<counter>` = `{key, value, deleted, hlc,
   reason}` (without the value when that would not fit, then `value_bytes`), so offline work is not lost, and answers
   `rejected`. Except for a bad key or the clock, it then restates its own version (or a tombstone) with a later stamp
   (`restated`), so the refused write is replaced everywhere, also in the sender's replica. A write refused without a
@@ -161,7 +173,8 @@ The protocol version is 1; a hub refuses a daemon with another one.
 - **Presence:** the hub writes `_nodes/<node>` = `{"online": true|false, "since": <ms>}` when a node connects and when
   it leaves, and marks everyone offline when it starts. A node has one connection: a new one closes the older (a laptop
   that slept and left it half open, or a second daemon under the same name, which the hub then reports).
-- **Heartbeat:** each side pings every 15 s; a connection silent for 45 s is closed, and the daemon connects anew.
+- **Heartbeat:** the hub pings every 15 s and the daemon answers (each side answers a ping); either side closes a
+  connection it has not heard from for 45 s, and the daemon connects anew.
 - **Scope:** a daemon started with `--sync tasks/,status/` sends its prefixes in the `hello`; the hub then sends it only
   entries under them (in the catch-up and live) and every `_` key (nodes, collections, settings, rejected writes),
   plus every entry the daemon itself wrote, as the confirmation. Sequence numbers stay global. The daemon refuses to
@@ -179,17 +192,27 @@ The protocol version is 1; a hub refuses a daemon with another one.
 The same in the hub and in every daemon:
 
 - **Memory:** a `BTreeMap` of the entries by key, and one by sequence number for catch-ups. Every read is answered here.
-- **Disk:** `data.log`, records of a 4-byte length, a CRC32 and the entry as JSON. On start the `snapshot` is loaded
+- **Disk:** `data.log` and `snapshot` start with a header, the magic `KHRK` and a format version (4 bytes,
+  big-endian, now 1). Records follow: a 4-byte length, a CRC32 and the entry as JSON. On start the `snapshot` is loaded
   and the log replayed (the later stamp wins, so replaying is idempotent). A torn or damaged record ends the log: it
   and everything after it is cut off, with a warning (for the hub, also a new epoch). No record larger than the largest
   readable one is ever written.
+- **Format versions:** files from before the header (format 0) start with a record length, which is never larger than
+  a few MB, so they cannot be taken for a header. They are read as before and rewritten with the header, atomically (a
+  temporary file, synced, renamed). This loses nothing: no cut, no new epoch, and a crash in between only means it runs
+  again on the next start. A file of a newer format is refused ("written by a newer kharka, format N; this one reads up
+  to 1") and left as it is. A file holding only part of a header counts as empty. A format 0 file starts with a 0 byte and a length
+  no larger than a record; a file that starts otherwise and not with the header (a damaged magic, or not a kharka
+  file) is refused ("starts with neither a header nor a record") and left as it is, like a newer format.
+- **Going back:** after loading there is always a `snapshot`, if only the header. kharka 0.0.1 reads the snapshot
+  first and refuses to start on one it cannot read, so it stops there and never cuts the log.
 - **Durability:** a tool's write is appended and synced before it is answered (on macOS a full sync, about 7 ms: some
   100 durable writes a second per daemon). What arrives from the hub, and what the hub takes from one push, is written
   as one batch with a single sync, and only published once it is durable: a catch-up of thousands of entries takes a
   fraction of a second, and local reads do not wait for it.
 - **Compaction:** once the log holds more than 1000 records and twice as many as there are entries, or more than 16 MB
   and twice the last snapshot, the entries are written to `snapshot.tmp`, synced, renamed to `snapshot`, and the log is
-  emptied. A crash in between loses nothing.
+  cut back to its header (never emptied, so it always starts with a whole header). A crash in between loses nothing.
 - **One process per folder:** a lock file (`flock`) keeps a second daemon or hub out.
 
 The replica lives in `${XDG_DATA_HOME:-~/.local/share}/kharka/replica`, the hub's log in `…/kharka/hub`; folders 0700
@@ -199,7 +222,8 @@ The replica lives in `${XDG_DATA_HOME:-~/.local/share}/kharka/replica`, the hub'
 ## The local socket
 
 Programs talk to the daemon of their machine over a Unix socket (`$XDG_RUNTIME_DIR/kharka/daemon.sock`, else
-`~/.local/state/kharka/daemon.sock`; not `$TMPDIR`, which a launchd agent and a shell do not reliably share), in JSON
+`~/.local/state/kharka/daemon.sock`; not `$TMPDIR`, which a launchd agent and a shell do not reliably share; the
+socket is 0600, and its folder 0700 when it is kharka's own or kharka creates it), in JSON
 lines: `get`, `put`, `del`, `ls`, `watch`, `unwatch`, `whoami`, `status`, `collections`. A watch is answered first, then streams every
 change under its prefix, `sync` when the hub comes or goes, and `reset` when it fell behind and starts over. The
 specification is [protocol.md](protocol.md).
@@ -211,6 +235,20 @@ the other side, since non-interactive shells often lack them in `PATH`) and spea
 `kharka bridge` connects them to the hub's socket. The hub opens no port; ssh and its keys decide who may
 connect. Anyone who can reach the hub's socket is trusted; the hub checks only that a node stamps its writes with its
 own name.
+
+## Compatibility
+
+kharka is a program: its contract is the command line, [the socket protocol](protocol.md), the sync protocol and the
+files on disk. The Rust library inside the crate exists for the binary, the tests and fuzzing, and may change in any
+release. Before 1.0:
+
+- **On-disk format:** a newer kharka reads every older format and rewrites it on start. An older kharka refuses a newer
+  format instead of cutting it, so going back a version may need the data of the newer one moved away.
+- **Sync protocol:** a hub refuses a daemon with another protocol version. A release that changes it says so in the
+  changelog, and the hub and every daemon are updated together.
+- **Socket protocol and command line:** additions (fields, operations, flags) may come in any release, so programs
+  should ignore fields they do not know. Removals and changes of meaning come only with a minor release and are named in the
+  changelog.
 
 ## Left out on purpose
 
@@ -225,5 +263,5 @@ own name.
 
 - A daemon that should follow two hubs, or a second hub as a standby.
 - A binary frame encoding once the protocol settles.
-- Packaging: a Homebrew tap and an AUR package.
+- Packaging for Linux distributions (an AUR package).
 - Client libraries (Rust, JavaScript) on top of [the socket protocol](protocol.md).
