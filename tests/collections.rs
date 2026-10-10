@@ -1,5 +1,5 @@
-//! Collections as data: protected ones from the hub's kharka.toml, own ones from any machine, strict mode, and writes
-//! the hub refused, kept under `_rejected/`.
+//! Collections as data: protected ones from the hub's kharka.toml (also against a restoring daemon), own ones from any
+//! machine, strict mode, and writes the hub refused, kept under `_rejected/`.
 
 mod common;
 
@@ -7,6 +7,9 @@ use std::fs;
 use std::path::Path;
 
 use common::*;
+use kharka::entry::Entry;
+use kharka::hlc::{Hlc, wall_ms};
+use kharka::store::{Options, Store};
 use serde_json::{Value, json};
 
 fn hub_target(dir: &Path) -> String {
@@ -165,6 +168,43 @@ fn a_write_refused_by_the_hub_is_kept_under_rejected() {
     // a record is cleared by deleting it
     assert!(run(dir, "a", &["del", &record_key]).status.success());
     wait_until("b sees it cleared", || get(dir, "b", &record_key).is_none());
+}
+
+#[test]
+fn a_restored_definition_does_not_replace_a_protected_collection() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir = dir.path();
+    fs::write(
+        dir.join("kharka.toml"),
+        "[collections.tasks]\nschema = { type = \"object\", required = [\"title\"] }\n",
+    )
+    .unwrap();
+    // a's replica, made beforehand: b's own definition of tasks, stamped after the one the hub is about to write (b's
+    // clock runs a minute ahead). a never synced with this hub, so it restores what it holds.
+    {
+        let mut store = Store::open(&dir.join("a"), "a", Options::default()).unwrap();
+        let later = Hlc {
+            wall_ms: wall_ms() + 60_000,
+            counter: 0,
+            node: "b".into(),
+        };
+        let own = Entry::new("_collections/tasks", Some(json!({ "kind": "state" })), later);
+        store.from_hub(own).unwrap();
+        assert_eq!(store.pending().len(), 1);
+    }
+    let hub = start_hub(dir);
+    let _a = start_daemon(dir, "a", Some(&hub_target(dir)));
+    wait_until("a restored the hub", || {
+        let status = status(dir, "a");
+        status["online"] == true && status["pending"] == 0
+    });
+
+    // the file's definition stays, restated over b's on a as well
+    let tasks = &collections(dir, "a")["collections"]["tasks"];
+    assert_eq!((&tasks["protected"], &tasks["kind"]), (&json!(true), &json!("record")));
+    let refused = run(dir, "a", &["put", "tasks/1", "{}"]);
+    assert!(stderr(&refused).contains("title is missing"), "{}", stderr(&refused));
+    assert!(hub.log().contains("kept the hub's _collections/tasks"), "{}", hub.log());
 }
 
 #[test]

@@ -1,6 +1,7 @@
 //! A hub and daemons: changes travel, offline writes arrive later, the latest write wins, a hub that lost its data is
 //! filled again, the ssh transport works through `kharka bridge`, a stamp from the future is refused (and does not hold
-//! up later writes), and a daemon too slow for the stream is caught up from the log.
+//! up later writes), stale writes are answered in frames that fit, and a daemon too slow for the stream is caught up
+//! from the log.
 
 mod common;
 
@@ -289,6 +290,80 @@ fn a_write_stamped_far_ahead_of_the_hub_is_refused_and_kept() {
         (Some(0), Some(0))
     );
     assert_eq!(hub.log().matches("refused").count(), 1, "{}", hub.log());
+}
+
+#[test]
+fn every_refusal_reaches_the_daemon() {
+    // more refusals at once than the 1024 direct answers a connection may have waiting (ANSWERS in src/hub.rs)
+    const WRITES: u32 = 1500;
+    let dir = tempfile::tempdir().unwrap();
+    let dir = dir.path();
+    {
+        let options = Options {
+            sync: false,
+            ..Options::default()
+        };
+        let mut store = Store::open(&dir.join("a"), "a", options).unwrap();
+        let ahead = wall_ms() + 10 * 60 * 1000;
+        for n in 0..WRITES {
+            let hlc = Hlc {
+                wall_ms: ahead,
+                counter: n,
+                node: "a".into(),
+            };
+            store
+                .from_hub(Entry::new(format!("tasks/{n}"), Some(json!(n)), hlc))
+                .unwrap();
+        }
+    }
+    let _hub = start_hub(dir);
+    let _a = start_daemon(dir, "a", Some(&hub_target(dir)));
+    wait_until("a has every refusal", || {
+        let status = status(dir, "a");
+        (status["refused"].as_u64(), status["pending"].as_u64()) == (Some(WRITES.into()), Some(0))
+    });
+}
+
+#[test]
+fn stale_writes_are_answered_in_frames_that_fit() {
+    // the hub holds more than a frame's 8 MB of large values; a pushes an older, small write to each key
+    const KEYS: u64 = 12;
+    let dir = tempfile::tempdir().unwrap();
+    let dir = dir.path();
+    let options = || Options {
+        sync: false,
+        ..Options::default()
+    };
+    {
+        let mut store = Store::open(&dir.join("a"), "a", options()).unwrap();
+        for n in 0..KEYS {
+            store.put(&format!("big/{n}"), json!(n), None).unwrap();
+        }
+    }
+    {
+        let mut store = Store::open(&dir.join("hub"), "hub", options()).unwrap();
+        let large = json!("x".repeat(900_000));
+        for n in 0..KEYS {
+            let later = Hlc {
+                wall_ms: wall_ms() + 1000,
+                counter: 0,
+                node: "b".into(),
+            };
+            store
+                .accept(Entry::new(format!("big/{n}"), Some(large.clone()), later))
+                .unwrap();
+        }
+    }
+    let hub = start_hub(dir);
+    // a syncs something else: the catch-up leaves big/ out, so a's writes go to the hub, which already has later ones
+    let _a = start_daemon_with(dir, "a", Some(&hub_target(dir)), &["--sync", "other/"]);
+    wait_until("a's writes are answered", || {
+        let status = status(dir, "a");
+        status["online"] == true && status["pending"] == 0
+    });
+    // answered on the first connection: the answer did not break it
+    assert_eq!(hub.log().matches("a connected").count(), 1, "{}", hub.log());
+    assert_eq!(get(dir, "a", "big/0"), None);
 }
 
 #[test]

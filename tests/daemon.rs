@@ -168,18 +168,56 @@ fn watch_and_write_on_one_connection() {
     );
 }
 
+/// A connection to the daemon `node`: a request line in, its answer out.
+fn connect(dir: &Path, node: &str) -> impl FnMut(Value) -> Value {
+    let stream = UnixStream::connect(socket(dir, node)).unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let mut lines = BufReader::new(stream).lines();
+    move |request| {
+        writeln!(writer, "{request}").unwrap();
+        serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap()
+    }
+}
+
 #[test]
 fn writes_survive_a_kill() {
+    const CLIENTS: usize = 8;
+    const WRITES: usize = 50;
     let dir = tempfile::tempdir().unwrap();
     let dir = dir.path();
     let daemon = start_daemon(dir, "a", None);
-    for n in 0..50 {
-        put(dir, "a", &format!("k/{n}"), &n.to_string());
-    }
+    // several clients at once: their writes are synced together, each answered once it is on disk
+    let stamps: Vec<String> = std::thread::scope(|threads| {
+        let clients: Vec<_> = (0..CLIENTS)
+            .map(|client| {
+                threads.spawn(move || {
+                    let mut ask = connect(dir, "a");
+                    (0..WRITES)
+                        .map(|n| {
+                            let answer =
+                                ask(json!({ "id": n, "op": "put", "key": format!("k/{client}/{n}"), "value": n }));
+                            assert_eq!(answer["ok"], true, "{answer}");
+                            answer["entry"]["hlc"].as_str().unwrap().to_string()
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        clients.into_iter().flat_map(|client| client.join().unwrap()).collect()
+    });
+    let distinct: std::collections::BTreeSet<&String> = stamps.iter().collect();
+    assert_eq!(distinct.len(), CLIENTS * WRITES, "every write its own stamp");
     drop(daemon); // SIGKILL: no shutdown, the socket stays behind
     let _daemon = start_daemon(dir, "a", None);
-    assert_eq!(get(dir, "a", "k/49").as_deref(), Some("49"));
-    assert_eq!(status(dir, "a")["entries"], 50);
+    assert_eq!(status(dir, "a")["entries"], CLIENTS * WRITES);
+    let mut ask = connect(dir, "a");
+    for client in 0..CLIENTS {
+        for n in 0..WRITES {
+            let answer = ask(json!({ "id": 0, "op": "get", "key": format!("k/{client}/{n}") }));
+            assert_eq!(answer["entry"]["value"], n);
+            assert_eq!(answer["entry"]["hlc"], stamps[client * WRITES + n]);
+        }
+    }
 }
 
 #[test]

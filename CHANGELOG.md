@@ -4,6 +4,28 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 the project follows [Semantic Versioning](https://semver.org/). Before 1.0, a minor release may still change the
 protocol or the on-disk format; the notes say so when it does.
 
+## [0.1.1] - 2026-10-10
+
+### Changed
+
+- Group commit for local writes: the writes that arrive while one is synced go to disk together, with one sync, and
+  each is answered once it is durable. Several tools writing at once get about four times as many durable writes a
+  second as before; nothing changes for a single tool or for the protocol.
+- The hub sends the changes already queued for a daemon together, in frames of about 1 MB, instead of one frame per
+  change; every entry is serialised once per frame. Daemons push the same way. With several daemons, a burst of
+  writes reaches all of them many times faster.
+- A reset (a new hub, or one that lost its data) compacts a replica once instead of twice.
+
+### Fixed
+
+- A push the hub already had later versions of could get an answer over the 8 MB frame limit (held values of up to
+  1 MB each), which closed the connection again and again; the answer now comes in frames of the usual size.
+- After a reset, a node's own definition of a collection the hub's kharka.toml protects, stamped later, replaced the
+  protected one, schema included. The hub now keeps its definition and checks restored definitions like pushed ones.
+- The hub no longer drops refusals when more than 1024 are waiting for a daemon (one that has 65536 waiting and does
+  not read them is disconnected instead), and a daemon saves the writes it got refused once per burst instead of once
+  each.
+
 ## [0.1.0] - 2026-10-10
 
 The first release.
@@ -38,4 +60,5 @@ The first release.
 - `kharka status` counts a refused write only while it is still held.
 - `--socket` in a folder kharka did not create no longer changes that folder's permissions.
 
+[0.1.1]: https://github.com/jakobbeyer/kharka/releases/tag/v0.1.1
 [0.1.0]: https://github.com/jakobbeyer/kharka/releases/tag/v0.1.0

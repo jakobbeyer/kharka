@@ -15,7 +15,8 @@ use anyhow::{Context, anyhow, bail};
 use serde_json::{Value, json};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::broadcast::error::{RecvError, TryRecvError};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Notify, broadcast, mpsc};
 use tokio::time::timeout;
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
@@ -31,9 +32,14 @@ use crate::store::{self, Store};
 
 /// Changes a connection may fall behind before it is caught up from the log.
 const BACKLOG: usize = 4096;
-/// Direct answers (confirmations, refusals) waiting for one connection; more are dropped: a dropped confirmation only
-/// means the write is pushed once more later.
+/// Direct answers (confirmations, pongs) waiting for one connection; more are dropped: a dropped confirmation only means
+/// the write is pushed once more later. Refusals are never dropped.
 const ANSWERS: usize = 1024;
+/// Refusals waiting for one connection. None is dropped: a connection with more waiting (a node that keeps pushing
+/// refused writes and does not read) is closed instead.
+const REFUSALS: usize = 65536;
+/// Changes the live stream looks at in one go: a node that syncs few of them gets its pings and answers in between.
+const COALESCE: usize = 1024;
 const HANDSHAKE: Duration = Duration::from_secs(10);
 /// How often the hub looks whether kharka.toml or a schema file changed.
 const CONFIG_CHECK: Duration = Duration::from_secs(2);
@@ -113,6 +119,9 @@ enum Verdict {
         reason: String,
         restate: bool,
     },
+    /// Not taken, without a word to the sender: the hub states its own version with a later stamp (a restored entry
+    /// that would replace what the hub decides itself).
+    Restate(String),
 }
 
 impl Hub {
@@ -249,20 +258,22 @@ impl Hub {
 
     /// Takes one push, as one batch: one sync for all its entries, published only once they are durable. A refused
     /// entry is kept under `_rejected/<node>/…` and answered with `rejected`; with `restate`, the hub then states its own
-    /// version with a later stamp, so that the sender's version is replaced everywhere.
+    /// version with a later stamp, so that the sender's version is replaced everywhere. The answers to a push that
+    /// changed nothing go in frames of the usual size (each entry the hub holds may have up to 1 MB).
     fn receive(
         &self,
         entries: Vec<Entry>,
         node: &str,
         restore: bool,
         direct: &mpsc::Sender<Frame>,
+        refused: &mpsc::Sender<Frame>,
     ) -> anyhow::Result<()> {
         let mut store = self.store();
         store.begin();
         let (mut kept, mut answers, mut refusals) = (Vec::new(), Vec::new(), Vec::new());
         for entry in entries {
             let verdict = if restore {
-                restoring(&entry)
+                restoring(&store, &entry)
             } else {
                 self.refusal(&store, &entry, node)
             };
@@ -293,10 +304,15 @@ impl Hub {
                         restated: restate,
                     });
                     if restate {
-                        store.observe(&entry.hlc);
-                        let current = store.held(&entry.key).and_then(Entry::live_value).cloned();
-                        kept.push(Hub::write_own(&mut store, entry.key, current)?);
+                        kept.push(Hub::restate(&mut store, entry)?);
                     }
+                }
+                Verdict::Restate(reason) => {
+                    eprintln!(
+                        "kharka: kept the hub's {} over the one {node} restored: {reason}",
+                        entry.key
+                    );
+                    kept.push(Hub::restate(&mut store, entry)?);
                 }
             }
         }
@@ -306,9 +322,22 @@ impl Hub {
             let _ = direct.try_send(Frame::Changes { entries: answers });
         }
         for refusal in refusals {
-            let _ = direct.try_send(refusal);
+            match refused.try_send(refusal) {
+                // closed: the connection is gone
+                Ok(()) | Err(TrySendError::Closed(_)) => {}
+                Err(TrySendError::Full(_)) => {
+                    bail!("{node} does not read its refusals, {REFUSALS} are waiting: the connection is closed")
+                }
+            }
         }
         Ok(())
+    }
+
+    /// The hub's version of a key it did not take `entry` for (its value, or a tombstone), stamped after `entry`.
+    fn restate(store: &mut Store, entry: Entry) -> anyhow::Result<Entry> {
+        store.observe(&entry.hlc);
+        let current = store.held(&entry.key).and_then(Entry::live_value).cloned();
+        Hub::write_own(store, entry.key, current)
     }
 
     /// Why a pushed entry is not taken, and whether the hub restates its own version.
@@ -358,16 +387,37 @@ impl Hub {
 }
 
 /// An entry a daemon restores after a reset (another node's, which the hub lost): taken as it is, so the latest write
-/// still wins. Left out: what the hub decides itself (`_nodes/`, the protected collections and the settings, which come
-/// from its file), and what could not be kept (a bad key, a value too large, a stamp from the future).
-fn restoring(entry: &Entry) -> Verdict {
+/// still wins. Left out: what the hub decides itself (`_nodes/`, the settings and a definition marked protected, which
+/// come from its file), and what could not be kept (a bad key, a value too large, a stamp from the future). A definition
+/// that would replace a collection the hub holds as protected, or that is not valid, is restated: the hub's version (or
+/// a tombstone) replaces it everywhere, the restoring replica included, which would otherwise push it again and again.
+fn restoring(store: &Store, entry: &Entry) -> Verdict {
     let own = entry.key.starts_with(NODES)
         || entry.key == SETTINGS
         || (entry.key.starts_with(COLLECTIONS) && entry.value["protected"] == true);
     let unfit = check_key(&entry.key).is_err()
         || entry.hlc.too_far_ahead(wall_ms())
         || entry.value.to_string().len() > MAX_VALUE;
-    if own || unfit { Verdict::Skip } else { Verdict::Take }
+    if own || unfit {
+        return Verdict::Skip;
+    }
+    let Some(name) = entry.key.strip_prefix(COLLECTIONS) else {
+        return Verdict::Take;
+    };
+    let held = store.held(&entry.key);
+    let problem = if held.is_some_and(|held| held.value["protected"] == true) {
+        format!("collection {name} is protected: only the hub's kharka.toml changes it")
+    } else if let Some(Err(problem)) = entry.live_value().map(|value| check_definition(name, value)) {
+        problem
+    } else {
+        return Verdict::Take;
+    };
+    // one that loses to the hub's version anyway changes nothing
+    if held.is_some_and(|held| held.hlc >= entry.hlc) {
+        Verdict::Skip
+    } else {
+        Verdict::Restate(short(&problem, MAX_REASON))
+    }
 }
 
 /// What is kept of a refused write. Small enough to stay a record: without its value when that is too large.
@@ -606,6 +656,10 @@ async fn serve(hub: &Arc<Hub>, stream: UnixStream) -> anyhow::Result<()> {
         reset,
     };
     let (direct, direct_out) = mpsc::channel(ANSWERS);
+    // large, so that a refusal is never dropped, and still never waited for: the reader must not stop reading while the
+    // writer waits for a node that pushes (and does not read) at that moment. A refusal is small, and the hub keeps a
+    // record of each anyway.
+    let (refused, refused_out) = mpsc::channel(REFUSALS);
     eprintln!(
         "kharka: {node} connected, from {}, syncing {scope}",
         if reset { 0 } else { since }
@@ -615,6 +669,7 @@ async fn serve(hub: &Arc<Hub>, stream: UnixStream) -> anyhow::Result<()> {
         scope,
         changes,
         direct: direct_out,
+        refused: refused_out,
     };
     let writing = tokio::spawn(write(hub.clone(), writer, welcome, backlog, seq, stream));
     let id = hub.next_connection.fetch_add(1, Ordering::Relaxed);
@@ -622,7 +677,7 @@ async fn serve(hub: &Arc<Hub>, stream: UnixStream) -> anyhow::Result<()> {
     if let Err(err) = hub.arrive(&node, id, closer.clone()) {
         eprintln!("kharka: could not note that {node} arrived: {err:#}");
     }
-    let read = read(hub, &node, &mut reader, &direct, &closer).await;
+    let read = read(hub, &node, &mut reader, &direct, &refused, &closer).await;
     if let Err(err) = hub.leave(&node, id) {
         eprintln!("kharka: could not note that {node} left: {err:#}");
     }
@@ -638,6 +693,7 @@ async fn read(
     node: &str,
     reader: &mut FramedRead<OwnedReadHalf, LengthDelimitedCodec>,
     direct: &mpsc::Sender<Frame>,
+    refused: &mpsc::Sender<Frame>,
     closer: &Notify,
 ) -> anyhow::Result<()> {
     loop {
@@ -649,7 +705,7 @@ async fn read(
         };
         match incoming {
             None => return Ok(()),
-            Some(Frame::Push { entries, restore }) => hub.receive(entries, node, restore, direct)?,
+            Some(Frame::Push { entries, restore }) => hub.receive(entries, node, restore, direct, refused)?,
             Some(Frame::Pong) => {}
             Some(Frame::Ping) => {
                 let _ = direct.try_send(Frame::Pong);
@@ -660,12 +716,59 @@ async fn read(
 }
 
 /// What a connection follows after the catch-up: every change the node syncs (and its own writes, as the
-/// confirmation), and the direct answers to its pushes.
+/// confirmation), the direct answers to its pushes, and the refusals.
 struct Stream {
     node: String,
     scope: Scope,
     changes: broadcast::Receiver<Arc<Entry>>,
     direct: mpsc::Receiver<Frame>,
+    refused: mpsc::Receiver<Frame>,
+}
+
+/// How the live stream goes on after `coalesce`.
+#[derive(Debug, PartialEq)]
+enum Streamed {
+    Going,
+    /// The node fell this many changes behind: it is caught up from the log.
+    Lagged(u64),
+    Closed,
+}
+
+/// Puts `first` and the changes already queued behind it into `frames`, up to about a frame's worth or `COALESCE`
+/// changes looked at, in the order received: a burst costs a node one frame (one serialisation, one write), not one per
+/// entry. Passes over what the node has already (at or before `last`, which it moves on) and what it does not sync.
+fn coalesce(
+    first: Result<Arc<Entry>, RecvError>,
+    changes: &mut broadcast::Receiver<Arc<Entry>>,
+    last: &mut u64,
+    wanted: impl Fn(&Entry) -> bool,
+    frames: &mut frame::Entries,
+) -> anyhow::Result<Streamed> {
+    let mut next = first;
+    for looked_at in 1.. {
+        match next {
+            Ok(entry) => {
+                if entry.seq > *last {
+                    *last = entry.seq;
+                    if wanted(&entry) && frames.add(&entry)? {
+                        return Ok(Streamed::Going);
+                    }
+                }
+            }
+            Err(RecvError::Lagged(skipped)) => return Ok(Streamed::Lagged(skipped)),
+            Err(RecvError::Closed) => return Ok(Streamed::Closed),
+        }
+        if looked_at == COALESCE {
+            break;
+        }
+        next = match changes.try_recv() {
+            Ok(entry) => Ok(entry),
+            Err(TryRecvError::Empty) => return Ok(Streamed::Going),
+            Err(TryRecvError::Lagged(skipped)) => Err(RecvError::Lagged(skipped)),
+            Err(TryRecvError::Closed) => Err(RecvError::Closed),
+        };
+    }
+    Ok(Streamed::Going)
 }
 
 /// Everything to one node: the welcome, what it missed, `caught_up`, then every change in sequence order, the direct
@@ -683,10 +786,12 @@ async fn write(
         scope,
         mut changes,
         mut direct,
+        mut refused,
     } = stream;
     let wanted = |entry: &Entry| scope.holds(&entry.key) || entry.hlc.node == node;
     frame::send(&mut writer, &welcome).await?;
-    send_entries(&mut writer, backlog).await?;
+    frame::send_entries(&mut writer, frame::Entries::changes(), &backlog).await?;
+    drop(backlog);
     frame::send(&mut writer, &Frame::CaughtUp { seq }).await?;
     // the position in the hub's sequence, also across entries this node does not sync
     let mut last = seq;
@@ -694,53 +799,43 @@ async fn write(
     let mut pings = tokio::time::interval_at(tokio::time::Instant::now() + ping, ping);
     loop {
         tokio::select! {
-            change = changes.recv() => match change {
-                Ok(entry) => {
-                    if entry.seq > last {
-                        last = entry.seq;
-                        if wanted(&entry) {
-                            send_entries(&mut writer, vec![Arc::unwrap_or_clone(entry)]).await?;
-                        }
+            change = changes.recv() => {
+                let mut frames = frame::Entries::changes();
+                let streamed = coalesce(change, &mut changes, &mut last, wanted, &mut frames)?;
+                frames.send(&mut writer).await?;
+                match streamed {
+                    Streamed::Going => {}
+                    Streamed::Lagged(skipped) => {
+                        eprintln!("kharka: {node} fell {skipped} changes behind the stream, caught up from the log");
+                        let missed = {
+                            let store = hub.store();
+                            changes = hub.changes.subscribe();
+                            let missed = store.since_where(last, wanted);
+                            last = last.max(store.last_seq());
+                            missed
+                        };
+                        frame::send_entries(&mut writer, frame::Entries::changes(), &missed).await?;
                     }
+                    Streamed::Closed => return Ok(()),
                 }
-                Err(RecvError::Lagged(skipped)) => {
-                    eprintln!("kharka: {node} fell {skipped} changes behind the stream, caught up from the log");
-                    let missed = {
-                        let store = hub.store();
-                        changes = hub.changes.subscribe();
-                        let missed = store.since_where(last, wanted);
-                        last = last.max(store.last_seq());
-                        missed
-                    };
-                    send_entries(&mut writer, missed).await?;
-                }
-                Err(RecvError::Closed) => return Ok(()),
             },
             answer = direct.recv() => match answer {
                 // an answer carrying an entry not streamed yet waits for the stream: sending it now would let the node
                 // count past changes still on their way to it
                 Some(Frame::Changes { mut entries }) => {
                     entries.retain(|entry| entry.seq <= last);
-                    if !entries.is_empty() {
-                        frame::send(&mut writer, &Frame::Changes { entries }).await?;
-                    }
+                    frame::send_entries(&mut writer, frame::Entries::changes(), &entries).await?;
                 }
                 Some(answer) => frame::send(&mut writer, &answer).await?,
+                None => return Ok(()),
+            },
+            refusal = refused.recv() => match refusal {
+                Some(refusal) => frame::send(&mut writer, &refusal).await?,
                 None => return Ok(()),
             },
             _ = pings.tick() => frame::send(&mut writer, &Frame::Ping).await?,
         }
     }
-}
-
-async fn send_entries(
-    writer: &mut FramedWrite<OwnedWriteHalf, LengthDelimitedCodec>,
-    entries: Vec<Entry>,
-) -> anyhow::Result<()> {
-    for batch in frame::batches(entries) {
-        frame::send(writer, &Frame::Changes { entries: batch }).await?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -767,6 +862,18 @@ mod tests {
 
     #[test]
     fn restoring_takes_other_nodes_writes_but_not_what_the_hub_decides() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = store::Options {
+            sync: false,
+            ..store::Options::default()
+        };
+        let mut store = Store::open(dir.path(), "hub", options).unwrap();
+        store
+            .accept(entry("_collections/x", json!({ "protected": true }), "10-0-hub"))
+            .unwrap();
+        store.accept(entry("_collections/own", json!({}), "10-0-a")).unwrap();
+        let restoring = |entry: &Entry| restoring(&store, entry);
+
         assert!(matches!(restoring(&entry("tasks/1", json!(1), "5-0-b")), Verdict::Take));
         assert!(matches!(
             restoring(&entry("_nodes/b", json!({}), "5-0-hub")),
@@ -777,17 +884,170 @@ mod tests {
             Verdict::Skip
         ));
         assert!(matches!(
-            restoring(&entry("_collections/x", json!({ "protected": true }), "5-0-hub")),
+            restoring(&entry("_collections/x", json!({ "protected": true }), "50-0-hub")),
             Verdict::Skip
         ));
         assert!(matches!(
-            restoring(&entry("_collections/own", json!({}), "5-0-b")),
+            restoring(&entry("_collections/own", json!({}), "50-0-b")),
+            Verdict::Take
+        ));
+        assert!(matches!(
+            restoring(&Entry::new("_collections/own", None, "50-0-b".parse().unwrap())),
             Verdict::Take
         ));
         assert!(matches!(
             restoring(&entry("tasks/2", json!(1), "99999999999999-0-b")),
             Verdict::Skip
         ));
+        // a node's own definition of a protected collection: the hub's stays, restated over a later one
+        assert!(matches!(
+            restoring(&entry("_collections/x", json!({ "kind": "state" }), "50-0-b")),
+            Verdict::Restate(reason) if reason.contains("x is protected")
+        ));
+        assert!(matches!(
+            restoring(&Entry::new("_collections/x", None, "50-0-b".parse().unwrap())),
+            Verdict::Restate(_)
+        ));
+        assert!(matches!(
+            restoring(&entry("_collections/x", json!({ "kind": "state" }), "5-0-b")),
+            Verdict::Skip
+        ));
+        // an invalid definition is checked as in a plain push
+        assert!(matches!(
+            restoring(&entry("_collections/bad", json!({ "kind": "nope" }), "50-0-b")),
+            Verdict::Restate(_)
+        ));
+    }
+
+    /// Entries numbered `seq` under `key`, as the stream carries them.
+    fn numbered(seq: u64, key: &str, value: Value) -> Arc<Entry> {
+        let mut entry = entry(key, value, &format!("{seq}-0-a"));
+        entry.seq = seq;
+        Arc::new(entry)
+    }
+
+    fn keys(frames: &mut frame::Entries) -> Vec<Vec<String>> {
+        frames
+            .read_back()
+            .into_iter()
+            .map(|frame| match frame {
+                Frame::Changes { entries } => entries.into_iter().map(|entry| entry.key).collect(),
+                other => panic!("{}", other.name()),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_stream_sends_what_is_queued_in_one_frame_in_order() {
+        let (sender, mut changes) = broadcast::channel(8);
+        for (seq, key) in [(1, "a/1"), (2, "b/2"), (3, "a/3"), (4, "a/4")] {
+            sender.send(numbered(seq, key, json!(seq))).unwrap();
+        }
+        // 1 came with the catch-up already, b/ is not synced
+        let mut last = 1;
+        let mut frames = frame::Entries::changes();
+        let first = Ok(changes.try_recv().unwrap());
+        let wanted = |entry: &Entry| entry.key.starts_with("a/");
+        assert_eq!(
+            coalesce(first, &mut changes, &mut last, wanted, &mut frames).unwrap(),
+            Streamed::Going
+        );
+        assert_eq!(last, 4);
+        assert_eq!(keys(&mut frames), [["a/3", "a/4"]]);
+
+        // up to about a frame: the rest waits for the next round
+        let big = json!("x".repeat(600_000));
+        for seq in 5..8 {
+            sender.send(numbered(seq, &format!("a/{seq}"), big.clone())).unwrap();
+        }
+        let first = Ok(changes.try_recv().unwrap());
+        assert_eq!(
+            coalesce(first, &mut changes, &mut last, wanted, &mut frames).unwrap(),
+            Streamed::Going
+        );
+        assert_eq!(keys(&mut frames), [["a/5"], ["a/6"]]);
+        assert_eq!(changes.try_recv().unwrap().key, "a/7");
+    }
+
+    #[test]
+    fn the_stream_looks_at_so_many_changes_in_one_go() {
+        let (sender, mut changes) = broadcast::channel(4096);
+        // none of them synced by this node: no frame fills up
+        for seq in 1..3000 {
+            sender.send(numbered(seq, &format!("b/{seq}"), json!(seq))).unwrap();
+        }
+        let first = Ok(changes.try_recv().unwrap());
+        let (mut last, mut frames) = (0, frame::Entries::changes());
+        let wanted = |entry: &Entry| entry.key.starts_with("a/");
+        assert_eq!(
+            coalesce(first, &mut changes, &mut last, wanted, &mut frames).unwrap(),
+            Streamed::Going
+        );
+        assert_eq!(last, COALESCE as u64);
+        assert!(keys(&mut frames).is_empty());
+        assert_eq!(
+            changes.try_recv().unwrap().seq,
+            COALESCE as u64 + 1,
+            "the rest waits for the next round"
+        );
+    }
+
+    fn hub(dir: &Path) -> Hub {
+        let options = store::Options {
+            sync: false,
+            ..store::Options::default()
+        };
+        let store = Store::open(dir, "hub", options).unwrap();
+        Hub {
+            rules: RwLock::new(Collections::from_entries(store.list(COLLECTIONS), store.get(SETTINGS))),
+            store: Mutex::new(store),
+            changes: broadcast::channel(BACKLOG).0,
+            epoch: "e".into(),
+            connected: Mutex::new(HashMap::new()),
+            next_connection: AtomicU64::new(1),
+            heartbeat: Heartbeat::default(),
+        }
+    }
+
+    #[test]
+    fn a_connection_that_does_not_read_its_refusals_is_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = hub(dir.path());
+        // stamped from the future: refused, without a restatement
+        let refused = |counter: u32| entry("k", json!(counter), &format!("{}-{counter}-a", wall_ms() + 3_600_000));
+        let (direct, _answers) = mpsc::channel(ANSWERS);
+        let (refusals, mut waiting) = mpsc::channel(2);
+        hub.receive(vec![refused(0), refused(1)], "a", false, &direct, &refusals)
+            .unwrap();
+        let err = hub
+            .receive(vec![refused(2)], "a", false, &direct, &refusals)
+            .unwrap_err();
+        assert!(err.to_string().contains("does not read its refusals"), "{err}");
+        // none dropped while the connection was open, and every refused write has its record
+        for counter in 0..2 {
+            assert!(matches!(waiting.try_recv(), Ok(Frame::Rejected { hlc, .. }) if hlc.counter == counter));
+        }
+        assert_eq!(hub.store().list(REJECTED).count(), 3);
+        // a connection that is gone does not care
+        drop(waiting);
+        hub.receive(vec![refused(3)], "a", false, &direct, &refusals).unwrap();
+    }
+
+    #[test]
+    fn the_stream_stops_where_it_lagged() {
+        let (sender, mut changes) = broadcast::channel(2);
+        sender.send(numbered(1, "a/1", json!(1))).unwrap();
+        let first = Ok(changes.try_recv().unwrap());
+        for seq in 2..6 {
+            sender.send(numbered(seq, &format!("a/{seq}"), json!(seq))).unwrap();
+        }
+        let (mut last, mut frames) = (0, frame::Entries::changes());
+        assert_eq!(
+            coalesce(first, &mut changes, &mut last, |_: &Entry| true, &mut frames).unwrap(),
+            Streamed::Lagged(2)
+        );
+        assert_eq!(last, 1);
+        assert_eq!(keys(&mut frames), [["a/1"]]);
     }
 
     #[test]

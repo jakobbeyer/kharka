@@ -3,6 +3,7 @@
 //! A session: `hello` with the position in the hub's sequence, the hub's `welcome`, the changes missed meanwhile up to
 //! `caught_up`, then everything still pending here, then live in both directions, with a ping every 15 s each way.
 
+use std::borrow::Borrow;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
@@ -207,11 +208,10 @@ async fn session(shared: &Arc<Shared>, hub: &HubTarget, data: &Path, heartbeat: 
         }
         {
             let mut store = shared.store();
-            store.forget_seqs().context("forgetting the old sequence numbers")?;
             // what only the hub writes comes from the new hub, in the catch-up that follows
             store
-                .remove_where(hub_owned)
-                .context("dropping the old hub's own entries")?;
+                .forget_seqs(hub_owned)
+                .context("forgetting the old hub's sequence numbers and entries")?;
         }
         let _ = fs::remove_file(data.join("position"));
     }
@@ -227,7 +227,11 @@ async fn session(shared: &Arc<Shared>, hub: &HubTarget, data: &Path, heartbeat: 
                 hlc,
                 reason,
                 restated,
-            }) => rejected(shared, data, key, hlc, &reason, restated),
+            }) => {
+                if rejected(shared, key, hlc, &reason, restated) {
+                    save_refused(data, &shared.refused());
+                }
+            }
             Some(Frame::Ping) => frame::send(&mut writer, &Frame::Pong).await?,
             Some(other) => bail!("the hub sent {} during the catch-up", other.name()),
             None => bail!("the hub closed the connection during the catch-up"),
@@ -243,6 +247,11 @@ async fn session(shared: &Arc<Shared>, hub: &HubTarget, data: &Path, heartbeat: 
     eprintln!("kharka: synced with {hub} up to {caught_up}");
     push_pending(shared, data, &node, &mut writer).await?;
     let mut heard = Instant::now();
+    let mut unsaved = Unsaved {
+        shared,
+        data,
+        noted: false,
+    };
     loop {
         let silence = tokio::time::sleep_until((heard + heartbeat.silence).into());
         tokio::select! {
@@ -251,17 +260,20 @@ async fn session(shared: &Arc<Shared>, hub: &HubTarget, data: &Path, heartbeat: 
                 match incoming? {
                     Some(Frame::Changes { entries }) => apply(shared, entries)?,
                     Some(Frame::Rejected { key, hlc, reason, restated }) => {
-                        rejected(shared, data, key, hlc, &reason, restated);
+                        unsaved.noted |= rejected(shared, key, hlc, &reason, restated);
                     }
                     Some(Frame::Ping) => frame::send(&mut writer, &Frame::Pong).await?,
                     Some(Frame::Pong) => {}
                     Some(other) => bail!("the hub sent {}", other.name()),
                     None => return Ok(()),
                 }
+                if reader.read_buffer().is_empty() {
+                    unsaved.save();
+                }
             }
             () = silence => bail!("the hub went silent"),
             change = local.recv() => {
-                let batch = match change {
+                let mut batch = match change {
                     Ok(entry) => {
                         let mut batch = vec![entry];
                         let mut lagged = false;
@@ -288,10 +300,34 @@ async fn session(shared: &Arc<Shared>, hub: &HubTarget, data: &Path, heartbeat: 
                     Err(RecvError::Closed) => return Ok(()),
                 };
                 // only local writes travel up; the hub's entries carry a sequence number
-                let entries = batch.into_iter().filter(|entry| entry.seq == 0).map(Arc::unwrap_or_clone).collect();
-                push(&mut writer, entries, false).await?;
+                batch.retain(|entry| entry.seq == 0);
+                push(&mut writer, &batch, false).await?;
             }
         }
+    }
+}
+
+/// Refusals noted in a session but not yet in the replica folder: a burst of them is saved once, when no more of it is
+/// read already, and at the latest when the session ends, however it ends (one lost in a crash is only pushed and
+/// refused once more).
+struct Unsaved<'a> {
+    shared: &'a Shared,
+    data: &'a Path,
+    noted: bool,
+}
+
+impl Unsaved<'_> {
+    fn save(&mut self) {
+        if self.noted {
+            save_refused(self.data, &self.shared.refused());
+            self.noted = false;
+        }
+    }
+}
+
+impl Drop for Unsaved<'_> {
+    fn drop(&mut self) {
+        self.save();
     }
 }
 
@@ -358,39 +394,25 @@ async fn push_pending<W: AsyncWrite + Unpin>(
             .into_iter()
             .partition::<Vec<_>, _>(|entry| entry.hlc.node == node)
     };
-    push(writer, others, true).await?;
-    push(writer, own, false).await
+    push(writer, &others, true).await?;
+    push(writer, &own, false).await
 }
 
 /// A write the hub did not take. It is kept on the hub under `_rejected/<node>/…`. When the hub restated its own
 /// version, that replaces it here as well; otherwise (a stamp from the future, a bad key) it stays here, and is no
-/// longer pushed.
-fn rejected(shared: &Shared, data: &Path, key: String, hlc: crate::hlc::Hlc, reason: &str, restated: bool) {
+/// longer pushed. Returns whether it was noted as refused; the caller saves that.
+fn rejected(shared: &Shared, key: String, hlc: crate::hlc::Hlc, reason: &str, restated: bool) -> bool {
     let node = shared.store().node().to_string();
     eprintln!("kharka: the hub did not take {key}: {reason} (kept under _rejected/{node}/)");
-    if !restated {
-        let mut refused = shared.refused();
-        refused.insert((key, hlc.to_string()));
-        save_refused(data, &refused);
-    }
+    !restated && shared.refused().insert((key, hlc.to_string()))
 }
 
-async fn push<W: AsyncWrite + Unpin>(
+async fn push<W: AsyncWrite + Unpin, E: Borrow<Entry>>(
     writer: &mut FramedWrite<W, LengthDelimitedCodec>,
-    entries: Vec<Entry>,
+    entries: &[E],
     restore: bool,
 ) -> anyhow::Result<()> {
-    for batch in frame::batches(entries) {
-        frame::send(
-            writer,
-            &Frame::Push {
-                entries: batch,
-                restore,
-            },
-        )
-        .await?;
-    }
-    Ok(())
+    frame::send_entries(writer, frame::Entries::push(restore), entries).await
 }
 
 /// The hub this replica synced with last: a hub with another epoch numbers its changes differently.
@@ -448,6 +470,65 @@ pub(crate) fn save_scope(data: &Path, scope: &Scope) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::tests::shared;
+    use crate::store::tests::counting;
+    use bytes::Bytes;
+    use futures_util::SinkExt;
+    use tokio::net::UnixListener;
+
+    #[tokio::test]
+    async fn a_refusal_is_saved_however_the_session_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("hub.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let hub = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, writer) = stream.into_split();
+            let (mut reader, mut writer) = (
+                FramedRead::new(reader, frame::codec()),
+                FramedWrite::new(writer, frame::codec()),
+            );
+            assert!(matches!(
+                frame::recv(&mut reader).await.unwrap(),
+                Some(Frame::Hello { .. })
+            ));
+            // in one write: the refusal, then a frame the daemon does not take, which ends the session with the
+            // refusal noted and more of the stream read already
+            let frames = [
+                Frame::Welcome {
+                    epoch: "e".into(),
+                    reset: false,
+                },
+                Frame::CaughtUp { seq: 0 },
+                Frame::Rejected {
+                    key: "k".into(),
+                    hlc: "1-0-a".parse().unwrap(),
+                    reason: "no".into(),
+                    restated: false,
+                },
+                Frame::Welcome {
+                    epoch: "e".into(),
+                    reset: false,
+                },
+            ];
+            for frame in &frames {
+                writer
+                    .feed(Bytes::from(serde_json::to_vec(frame).unwrap()))
+                    .await
+                    .unwrap();
+            }
+            SinkExt::<Bytes>::flush(&mut writer).await.unwrap();
+            // open until the daemon is done
+            frame::recv(&mut reader).await.ok();
+        });
+        let shared = Arc::new(shared(counting("a").0));
+        let data = dir.path().join("replica");
+        fs::create_dir(&data).unwrap();
+        let ended = session(&shared, &HubTarget::Unix(socket), &data, Heartbeat::default()).await;
+        assert!(ended.unwrap_err().to_string().contains("the hub sent welcome"));
+        assert!(saved_refused(&data).contains(&("k".to_string(), "1-0-a".to_string())));
+        hub.abort();
+    }
 
     #[test]
     fn hub_targets() {

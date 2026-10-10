@@ -100,6 +100,8 @@ pub struct Store {
     batch: Option<Vec<(Entry, Option<Entry>)>>,
     /// The highest sequence number when the batch was opened, restored when it fails.
     batch_seq: u64,
+    /// The open batch holds a write in place of a later pending entry: it is written by a compaction (see `replace`).
+    batch_compacts: bool,
 }
 
 impl Store {
@@ -119,6 +121,7 @@ impl Store {
             options,
             batch: None,
             batch_seq: 0,
+            batch_compacts: false,
         };
         let now = wall_ms();
         for entry in loaded {
@@ -144,17 +147,24 @@ impl Store {
         if self.batch.is_none() {
             self.batch = Some(Vec::new());
             self.batch_seq = self.last_seq;
+            self.batch_compacts = false;
         }
     }
 
-    /// Writes the open batch. When that fails, its entries leave memory again, as if they had never been written.
+    /// Writes the open batch: appended, or, when it replaces a later pending entry, by a compaction. When that fails,
+    /// its entries leave memory again, as if they had never been written.
     pub fn commit(&mut self) -> io::Result<()> {
         let Some(batch) = self.batch.take() else { return Ok(()) };
         if batch.is_empty() {
             return Ok(());
         }
-        let entries: Vec<Entry> = batch.iter().map(|(entry, _)| entry.clone()).collect();
-        if let Err(err) = self.storage.append(&entries) {
+        let written = if self.batch_compacts {
+            self.storage.compact(&mut self.entries.values())
+        } else {
+            let entries: Vec<Entry> = batch.iter().map(|(entry, _)| entry.clone()).collect();
+            self.storage.append(&entries)
+        };
+        if let Err(err) = written {
             for (entry, replaced) in batch.into_iter().rev() {
                 self.unset(&entry.key);
                 if let Some(replaced) = replaced {
@@ -296,32 +306,19 @@ impl Store {
         }
     }
 
-    /// Forgets every sequence number: the hub is a different one (or lost its data), so everything held is pending
-    /// again until the new hub confirms it.
-    pub fn forget_seqs(&mut self) -> io::Result<()> {
+    /// Forgets every sequence number and removes the entries `drop` says yes to, with one compaction: the hub is a
+    /// different one (or lost its data), so everything held is pending again until the new hub confirms it, and what
+    /// only the old hub wrote goes. Returns how many entries went.
+    pub fn forget_seqs(&mut self, drop: impl Fn(&Entry) -> bool) -> io::Result<usize> {
+        let before = self.entries.len();
+        self.entries.retain(|_, entry| !drop(entry));
         for entry in self.entries.values_mut() {
             entry.seq = 0;
         }
         self.by_seq.clear();
         self.last_seq = 0;
-        self.storage.compact(&mut self.entries.values())
-    }
-
-    /// Removes the entries `drop` says yes to, pending or not. Returns how many went.
-    pub fn remove_where(&mut self, drop: impl Fn(&Entry) -> bool) -> io::Result<usize> {
-        let before = self.entries.len();
-        self.entries.retain(|_, entry| !drop(entry));
-        let removed = before - self.entries.len();
-        if removed > 0 {
-            self.by_seq = self
-                .entries
-                .values()
-                .filter(|entry| entry.seq > 0)
-                .map(|entry| (entry.seq, entry.key.clone()))
-                .collect();
-            self.storage.compact(&mut self.entries.values())?;
-        }
-        Ok(removed)
+        self.storage.compact(&mut self.entries.values())?;
+        Ok(before - self.entries.len())
     }
 
     /// Keeps only the entries `keep` says yes to, and those still pending (a local write the hub has not seen must not
@@ -375,27 +372,16 @@ impl Store {
 
     // ── inside ──
 
-    /// A write of this node (never inside a batch). The clock does not follow a stamp too far ahead of it (see
-    /// `Clock::observe_at`), so a held entry stamped like that would win over the write, by last writer wins, here and on
-    /// the hub. When it is this node's own and the hub never confirmed it (a write made while this clock was wrong,
-    /// pending or refused by the hub), the write replaces it all the same: the hub decides by last writer wins as
-    /// always, takes this write if it never took the old one, and otherwise answers with the old one, which this
-    /// replica takes back. Any other such entry refuses the write, until the wall clock catches up.
+    /// A write of this node. The clock does not follow a stamp too far ahead of it (see `Clock::observe_at`), so a held
+    /// entry stamped like that would win over the write, by last writer wins, here and on the hub. When it is this
+    /// node's own and the hub never confirmed it (a write made while this clock was wrong, pending or refused by the
+    /// hub), the write replaces it all the same: the hub decides by last writer wins as always, takes this write if it
+    /// never took the old one, and otherwise answers with the old one, which this replica takes back. Any other such
+    /// entry refuses the write, until the wall clock catches up.
     fn write_local(&mut self, key: &str, value: Option<Value>) -> Result<Entry, Error> {
         // one reading of the clock: a clock stepping back between two would let the write sort before the held entry
         let now = wall_ms();
-        let over_own = match self.entries.get(key) {
-            Some(held) if held.hlc.too_far_ahead(now) => {
-                if held.hlc.node != self.clock.node() || held.seq > 0 {
-                    return Err(Error::Ahead {
-                        key: key.to_string(),
-                        hlc: held.hlc.clone(),
-                    });
-                }
-                true
-            }
-            _ => false,
-        };
+        let over_own = self.over_own(key, now)?;
         let entry = Entry::new(key, value, self.stamp_at(key, now));
         if over_own {
             self.replace(entry.clone())?;
@@ -405,10 +391,33 @@ impl Store {
         Ok(entry)
     }
 
+    /// Whether a write to `key` at `now` goes in place of an own pending entry stamped too far ahead; `Ahead` when
+    /// another entry stamped too far ahead refuses it.
+    fn over_own(&self, key: &str, now: u64) -> Result<bool, Error> {
+        match self.entries.get(key) {
+            Some(held) if held.hlc.too_far_ahead(now) => {
+                if held.hlc.node != self.clock.node() || held.seq > 0 {
+                    return Err(Error::Ahead {
+                        key: key.to_string(),
+                        hlc: held.hlc.clone(),
+                    });
+                }
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     /// Puts a write in place of a later pending entry. Loading the log would keep the later one, so the store is
-    /// compacted at once instead of appending: the snapshot holds the write, before it is answered.
+    /// compacted instead of appending: the snapshot holds the write, before it is answered. In a batch, the batch is
+    /// written that way at `commit`.
     fn replace(&mut self, entry: Entry) -> io::Result<()> {
-        let replaced = self.entries.insert(entry.key.clone(), entry);
+        let replaced = self.entries.insert(entry.key.clone(), entry.clone());
+        if let Some(batch) = &mut self.batch {
+            batch.push((entry, replaced));
+            self.batch_compacts = true;
+            return Ok(());
+        }
         let compacted = self.storage.compact(&mut self.entries.values());
         if compacted.is_err()
             && let Some(replaced) = replaced
@@ -494,7 +503,7 @@ fn check_size(value: &Value) -> Result<(), Error> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::hlc::MAX_DRIFT_MS;
     use serde_json::json;
@@ -616,7 +625,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut store = open(dir.path(), "a");
         store.from_hub(remote("x", json!(1), "5-0-b", 3)).unwrap();
-        store.forget_seqs().unwrap();
+        store.forget_seqs(|_| false).unwrap();
         assert_eq!(store.last_seq(), 0);
         assert_eq!(store.pending().len(), 1);
         drop(store);
@@ -639,7 +648,7 @@ mod tests {
         assert!(open(dir.path(), "a").get("status/b").is_none());
     }
 
-    /// Storage that counts appends and fails on demand.
+    /// Storage that counts appends and fails (appends and compactions) on demand.
     struct Counting {
         appends: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         fail: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -659,6 +668,9 @@ mod tests {
             Ok(())
         }
         fn compact(&mut self, _: &mut dyn Iterator<Item = &Entry>) -> io::Result<()> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(io::Error::other("disk full"));
+            }
             Ok(())
         }
         fn appended(&self) -> usize {
@@ -675,7 +687,9 @@ mod tests {
         }
     }
 
-    fn counting(
+    /// A store on `Counting` storage, with its count of appends and the switch that makes them fail (the daemon's tests
+    /// use it too).
+    pub(crate) fn counting(
         node: &str,
     ) -> (
         Store,
@@ -859,6 +873,64 @@ mod tests {
         let store = open(dir.path(), "n");
         assert_eq!(store.get("k/ahead").unwrap().value, json!("now"));
         assert_eq!(store.held("k/last").unwrap().hlc, deleted);
+    }
+
+    #[test]
+    fn local_writes_in_a_batch_see_each_other_and_one_that_replaces_compacts() {
+        let (mut store, appends, fail) = counting("n");
+        let far = ahead(MAX_DRIFT_MS + 60_000, "n");
+        store
+            .write(Entry::new("k/ahead", Some(json!("ahead")), far.clone()))
+            .unwrap();
+        store
+            .write(Entry::new("k/later", Some(json!("ahead")), far.clone()))
+            .unwrap();
+        store.begin();
+        let first = store.put("k/other", json!(1), None).unwrap();
+        let second = store.put("k/other", json!(2), Some(&first.hlc)).unwrap();
+        assert!(second.hlc > first.hlc);
+        assert!(matches!(
+            store.put("k/other", json!(3), Some(&first.hlc)),
+            Err(Error::Conflict { current: Some(ref hlc) }) if *hlc == second.hlc
+        ));
+        // decided with the write's own reading of the clock, and made in the batch
+        let now = store.put("k/ahead", json!("now"), None).unwrap();
+        assert!(now.hlc > second.hlc && now.hlc < far);
+        store.commit().unwrap();
+        assert_eq!(
+            appends.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the entries ahead; the batch went in by a compaction"
+        );
+        assert_eq!(store.get("k/other").unwrap().value, json!(2));
+        assert_eq!(store.get("k/ahead").unwrap().hlc, now.hlc);
+
+        // a compaction that fails takes the batch back, the entry it replaced included
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        store.begin();
+        store.put("k/new", json!(1), None).unwrap();
+        store.put("k/later", json!("now"), None).unwrap();
+        assert!(store.commit().is_err());
+        assert!(store.get("k/new").is_none());
+        assert_eq!(store.get("k/later").unwrap().hlc, far);
+    }
+
+    #[test]
+    fn a_batch_that_replaces_is_on_disk_once_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = open(dir.path(), "n");
+        let far = ahead(MAX_DRIFT_MS + 60_000, "n");
+        store.write(Entry::new("k/ahead", Some(json!("ahead")), far)).unwrap();
+        store.begin();
+        store.put("k/before", json!(1), None).unwrap();
+        let now = store.put("k/ahead", json!("now"), None).unwrap();
+        store.put("k/after", json!(2), None).unwrap();
+        store.commit().unwrap();
+        drop(store);
+        let store = open(dir.path(), "n");
+        assert_eq!(store.get("k/ahead").unwrap().hlc, now.hlc);
+        assert_eq!(store.get("k/before").unwrap().value, json!(1));
+        assert_eq!(store.get("k/after").unwrap().value, json!(2));
     }
 
     #[test]

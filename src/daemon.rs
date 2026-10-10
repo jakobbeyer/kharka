@@ -3,19 +3,21 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::future::Future;
+use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, TryLockError};
+use std::thread;
+use std::time::{Duration, Instant};
 
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::sync::broadcast::error::RecvError;
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 
@@ -64,6 +66,8 @@ pub(crate) struct Shared {
     pub full_catch_up: AtomicBool,
     /// Writes the hub refused for good (key, stamp): no longer pushed.
     refused: Mutex<BTreeSet<(String, String)>>,
+    /// Threads waiting for the store's lock: the writer lets them in before its next group.
+    waiting: AtomicUsize,
 }
 
 /// Whether a key holds rules: a collection or the settings.
@@ -73,7 +77,16 @@ fn is_rule(key: &str) -> bool {
 
 impl Shared {
     pub fn store(&self) -> MutexGuard<'_, Store> {
-        self.store.lock().unwrap_or_else(PoisonError::into_inner)
+        match self.store.try_lock() {
+            Ok(store) => store,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                self.waiting.fetch_add(1, Ordering::SeqCst);
+                let store = self.store.lock().unwrap_or_else(PoisonError::into_inner);
+                self.waiting.fetch_sub(1, Ordering::SeqCst);
+                store
+            }
+        }
     }
 
     pub fn refused(&self) -> MutexGuard<'_, BTreeSet<(String, String)>> {
@@ -148,30 +161,35 @@ pub async fn run(options: Options, shutdown: impl Future<Output = ()>) -> anyhow
         scope: options.sync.clone(),
         full_catch_up: AtomicBool::new(full_catch_up),
         refused: Mutex::new(sync::saved_refused(&options.data)),
+        waiting: AtomicUsize::new(0),
     });
+    let (writes, queue) = mpsc::unbounded_channel();
+    let mut writer_stopped = start_writer(shared.clone(), queue);
     let syncing = options
         .hub
         .map(|hub| tokio::spawn(sync::run(shared.clone(), hub, options.data.clone(), options.heartbeat)));
     tokio::pin!(shutdown);
-    loop {
+    // a daemon whose writer is gone answers no write any more: it ends, so that the service manager starts it anew
+    let ended = loop {
         tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
-                    tokio::spawn(serve(stream, shared.clone()));
+                    tokio::spawn(serve(stream, shared.clone(), writes.clone()));
                 }
                 Err(err) => {
                     eprintln!("kharka: accept failed: {err}");
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             },
-            () = &mut shutdown => break,
+            _ = &mut writer_stopped => break Err(anyhow!("the writer of the local writes stopped")),
+            () = &mut shutdown => break Ok(()),
         }
-    }
+    };
     if let Some(task) = syncing {
         task.abort();
     }
     let _ = fs::remove_file(&options.socket);
-    Ok(())
+    ended
 }
 
 /// When the scope differs from the last run: the entries it no longer holds go (local writes the hub does not have yet
@@ -237,7 +255,7 @@ enum Request {
 }
 
 /// One connection: requests in, answers and watch events out, through one writer so that lines never interleave.
-async fn serve(stream: UnixStream, shared: Arc<Shared>) {
+async fn serve(stream: UnixStream, shared: Arc<Shared>, writes: mpsc::UnboundedSender<Write>) {
     let (reader, mut writer) = stream.into_split();
     let mut lines = FramedRead::new(reader, LinesCodec::new_with_max_length(MAX_LINE));
     let (out, mut outbox) = mpsc::channel::<String>(OUTBOX);
@@ -253,7 +271,11 @@ async fn serve(stream: UnixStream, shared: Arc<Shared>) {
         let mut started = None;
         let answer = match line {
             Ok(line) if line.trim().is_empty() => continue,
-            Ok(line) => handle(&shared, &line, &mut watches, &mut started),
+            Ok(line) => match handle(&shared, &line, &writes, &mut watches, &mut started) {
+                Answer::Now(answer) => answer,
+                // the next request waits for it: answers keep the order of the requests
+                Answer::Later(id, written) => written.await.unwrap_or_else(|_| error(&id, "io", "the writer stopped")),
+            },
             Err(LinesCodecError::MaxLineLengthExceeded) => error(
                 &Value::Null,
                 "invalid",
@@ -290,21 +312,29 @@ struct WatchStart {
     current: Vec<Entry>,
 }
 
-/// The answer to one request line. A watch is subscribed here and left in `started` for the caller to run.
+/// What a request line gets: its answer, or, for a tool's write, its answer once the write's group is durable.
+enum Answer {
+    Now(Value),
+    Later(Value, oneshot::Receiver<Value>),
+}
+
+/// The answer to one request line. A watch is subscribed here and left in `started` for the caller to run; a tool's
+/// put or del goes to the writer.
 fn handle(
     shared: &Shared,
     line: &str,
+    writes: &mpsc::UnboundedSender<Write>,
     watches: &mut HashMap<String, JoinHandle<()>>,
     started: &mut Option<WatchStart>,
-) -> Value {
+) -> Answer {
     let raw: Value = match serde_json::from_str(line) {
         Ok(raw) => raw,
-        Err(err) => return error(&Value::Null, "invalid", &format!("not JSON: {err}")),
+        Err(err) => return Answer::Now(error(&Value::Null, "invalid", &format!("not JSON: {err}"))),
     };
     let id = raw.get("id").cloned().unwrap_or(Value::Null);
     let request = match Request::deserialize(raw) {
         Ok(request) => request,
-        Err(err) => return error(&id, "invalid", &err.to_string()),
+        Err(err) => return Answer::Now(error(&id, "invalid", &err.to_string())),
     };
     let scope = &shared.scope;
     let not_synced = |what: &str| {
@@ -314,7 +344,7 @@ fn handle(
             &format!("{what} is not synced to this machine, which syncs {scope}"),
         )
     };
-    match request {
+    Answer::Now(match request {
         Request::Get { key } if check_key(&key).is_ok() && !scope.holds(&key) => not_synced(&key),
         Request::Put { key, .. } | Request::Del { key, .. } if check_key(&key).is_ok() && !scope.holds(&key) => {
             not_synced(&key)
@@ -331,15 +361,7 @@ fn handle(
             }
             Err(problem) => error(&id, "invalid", &problem),
         },
-        Request::Put { key, value, if_hlc } => {
-            let mut store = shared.store();
-            let checked = shared.rules().check(&key, Some(&value), store.node());
-            let result = match checked {
-                Ok(()) => store.put(&key, value, if_hlc.as_ref()).map(Some),
-                Err(problem) => Err(store::Error::Invalid(problem)),
-            };
-            written(shared, &store, &id, result)
-        }
+        Request::Put { key, value, if_hlc } => return queue(writes, id, key, Some(value), if_hlc),
         // a record of a refused write is cleared by deleting it
         Request::Del { key, if_hlc } if key.starts_with(REJECTED) && check_key(&key).is_ok() => {
             let mut store = shared.store();
@@ -351,15 +373,7 @@ fn handle(
             };
             written(shared, &store, &id, result)
         }
-        Request::Del { key, if_hlc } => {
-            let mut store = shared.store();
-            let checked = shared.rules().check(&key, None, store.node());
-            let result = match checked {
-                Ok(()) => store.delete(&key, if_hlc.as_ref()),
-                Err(problem) => Err(store::Error::Invalid(problem)),
-            };
-            written(shared, &store, &id, result)
-        }
+        Request::Del { key, if_hlc } => return queue(writes, id, key, None, if_hlc),
         Request::Ls { prefix } => match check_prefix(&prefix) {
             Ok(()) => {
                 let entries: Vec<Value> = shared
@@ -373,11 +387,15 @@ fn handle(
         },
         Request::Watch { prefix, initial } => {
             if let Err(problem) = check_prefix(&prefix) {
-                return error(&id, "invalid", &problem);
+                return Answer::Now(error(&id, "invalid", &problem));
             }
             let name = id.to_string();
             if watches.get(&name).is_some_and(|task| !task.is_finished()) {
-                return error(&id, "invalid", "a watch with this id runs already on this connection");
+                return Answer::Now(error(
+                    &id,
+                    "invalid",
+                    "a watch with this id runs already on this connection",
+                ));
             }
             let (changes, current) = subscribe(shared, &prefix, initial);
             let mut online = shared.online.subscribe();
@@ -436,7 +454,7 @@ fn handle(
             let mut store = shared.store();
             let result = match check_definition(&name, &definition) {
                 Err(problem) => Err(store::Error::Invalid(problem)),
-                Ok(_) if shared.protected(&store, &name) => return protected(&id, &name),
+                Ok(_) if shared.protected(&store, &name) => return Answer::Now(protected(&id, &name)),
                 Ok(_) => store
                     .write_own(&format!("{COLLECTIONS}{name}"), Some(definition))
                     .map(Some),
@@ -447,7 +465,7 @@ fn handle(
             let mut store = shared.store();
             let key = format!("{COLLECTIONS}{name}");
             let result = if shared.protected(&store, &name) {
-                return protected(&id, &name);
+                return Answer::Now(protected(&id, &name));
             } else if store.get(&key).is_none() {
                 Ok(None)
             } else {
@@ -455,6 +473,136 @@ fn handle(
             };
             written(shared, &store, &id, result)
         }
+    })
+}
+
+/// A tool's put (with a value) or del (without), waiting for its group.
+struct Write {
+    id: Value,
+    key: String,
+    value: Option<Value>,
+    if_hlc: Option<Hlc>,
+    answer: oneshot::Sender<Value>,
+}
+
+/// Hands a write to the writer. Each connection waits for the answer before its next request, so the queue holds at
+/// most one write per connection.
+fn queue(
+    writes: &mpsc::UnboundedSender<Write>,
+    id: Value,
+    key: String,
+    value: Option<Value>,
+    if_hlc: Option<Hlc>,
+) -> Answer {
+    let (answer, written) = oneshot::channel();
+    // should the writer be gone, the write is dropped with its sender, and the answer says so
+    let _ = writes.send(Write {
+        id: id.clone(),
+        key,
+        value,
+        if_hlc,
+        answer,
+    });
+    Answer::Later(id, written)
+}
+
+/// Starts the writer on a thread of its own. What it returns completes once that thread ends, which, while the daemon
+/// holds a sender of the queue, only a panic makes it do.
+fn start_writer(shared: Arc<Shared>, queue: mpsc::UnboundedReceiver<Write>) -> oneshot::Receiver<()> {
+    let (running, stopped) = oneshot::channel::<()>();
+    thread::spawn(move || {
+        // dropped when the thread ends, also by a panic
+        let _running = running;
+        writer(&shared, queue);
+    });
+    stopped
+}
+
+/// The tools' writes in groups, on a thread of its own, since the store's lock is held across the sync: what arrives
+/// while one group is synced queues up and is written as the next, with one append and one sync for all of it.
+fn writer(shared: &Shared, mut queue: mpsc::UnboundedReceiver<Write>) {
+    // since when threads have been waiting for the store's lock after every group
+    let mut kept_out = None;
+    while let Some(first) = queue.blocking_recv() {
+        let mut group = vec![first];
+        while let Ok(write) = queue.try_recv() {
+            group.push(write);
+        }
+        write_group(shared, group);
+        if shared.waiting.load(Ordering::SeqCst) == 0 {
+            kept_out = None;
+        } else if kept_out.get_or_insert_with(Instant::now).elapsed() >= KEPT_OUT {
+            let_them_in(shared);
+            kept_out = None;
+        }
+    }
+}
+
+/// How long threads may wait for the store's lock while the writer takes it group after group, before it lets them in.
+const KEPT_OUT: Duration = Duration::from_millis(100);
+/// How long the writer waits, at most, for them to get it.
+const HAND_OVER: Duration = Duration::from_millis(1);
+
+/// The store's lock is free now. A mutex is not fair: under a steady stream of writes the writer takes it again before
+/// a thread waiting for it gets in, and could keep it out for good. So once threads have waited through `KEPT_OUT` of
+/// groups, the writer waits briefly for them to get it first, spinning rather than yielding (a yield costs a whole time
+/// slice on a busy machine). Not after every group: the sync, let in, pushes what it has so far, and many small pushes
+/// cost syncs on the hub and on every replica.
+fn let_them_in(shared: &Shared) {
+    let since = Instant::now();
+    while shared.waiting.load(Ordering::SeqCst) > 0 && since.elapsed() < HAND_OVER {
+        std::hint::spin_loop();
+    }
+}
+
+/// Makes the writes of a group in their order, each checked against the state the ones before it left (a refused one
+/// changes nothing), and commits them together. Each is answered, and published, only once it is durable. A commit that
+/// fails took them out of memory again: each write whose answer the group's state decided gets the error.
+fn write_group(shared: &Shared, group: Vec<Write>) {
+    let mut store = shared.store();
+    let mut made = Vec::new();
+    store.begin();
+    for write in group {
+        let Write {
+            id,
+            key,
+            value,
+            if_hlc,
+            answer,
+        } = write;
+        let result = make(shared, &mut store, &key, value, if_hlc.as_ref());
+        made.push((id, answer, result));
+    }
+    let committed = store.commit();
+    for (id, answer, result) in made {
+        let result = match (&committed, result) {
+            // what the state of the group decided goes with it: a write made, a delete that found nothing (an earlier
+            // one of the group deleted it), a conflict or `ahead` against a stamp of the group
+            (Err(err), Ok(_) | Err(store::Error::Conflict { .. } | store::Error::Ahead { .. })) => {
+                Err(store::Error::Io(io::Error::new(err.kind(), err.to_string())))
+            }
+            // a check of the write alone (key, value, collection) stands
+            (_, result) => result,
+        };
+        let _ = answer.send(written(shared, &store, &id, result));
+    }
+}
+
+/// A tool's write, checked by the collections first.
+fn make(
+    shared: &Shared,
+    store: &mut Store,
+    key: &str,
+    value: Option<Value>,
+    if_hlc: Option<&Hlc>,
+) -> Result<Option<Entry>, store::Error> {
+    shared
+        .rules()
+        .check(key, value.as_ref(), store.node())
+        .map_err(store::Error::Invalid)?;
+    match value {
+        Some(value) => store.put(key, value, if_hlc).map(Some),
+        None => store.delete(key, if_hlc),
     }
 }
 
@@ -613,4 +761,259 @@ fn line_of(value: Value) -> String {
     let mut line = value.to_string();
     line.push('\n');
     line
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::hlc::MAX_DRIFT_MS;
+    use crate::storage::Storage;
+    use crate::store::tests::counting;
+
+    /// The daemon's state around a store, without a hub (the sync's tests use it too).
+    pub(crate) fn shared(store: Store) -> Shared {
+        Shared {
+            rules: RwLock::new(Shared::rules_of(&store, None)),
+            store: Mutex::new(store),
+            changes: broadcast::channel(BACKLOG).0,
+            file: None,
+            online: watch::channel(false).0,
+            hub: None,
+            scope: Scope::everything(),
+            full_catch_up: AtomicBool::new(false),
+            refused: Mutex::new(BTreeSet::new()),
+            waiting: AtomicUsize::new(0),
+        }
+    }
+
+    /// The writes through the writer, queued all at once, as by clients writing at the same time; their answers.
+    fn write_all(shared: &Shared, writes: &[(&str, Option<Value>, Option<&Hlc>)]) -> Vec<Value> {
+        let (writes_to, queued) = mpsc::unbounded_channel();
+        let answers: Vec<_> = writes
+            .iter()
+            .enumerate()
+            .map(|(n, (key, value, if_hlc))| {
+                match queue(&writes_to, json!(n), key.to_string(), value.clone(), if_hlc.cloned()) {
+                    Answer::Later(_, answer) => answer,
+                    Answer::Now(answer) => panic!("answered at once: {answer}"),
+                }
+            })
+            .collect();
+        drop(writes_to);
+        writer(shared, queued);
+        answers
+            .into_iter()
+            .map(|answer| answer.blocking_recv().unwrap())
+            .collect()
+    }
+
+    fn hlc(answer: &Value) -> Hlc {
+        answer["entry"]["hlc"].as_str().unwrap().parse().unwrap()
+    }
+
+    fn published(changes: &mut broadcast::Receiver<Arc<Entry>>) -> Vec<(String, Value)> {
+        let mut entries = Vec::new();
+        while let Ok(entry) = changes.try_recv() {
+            entries.push((entry.key.clone(), entry.value.clone()));
+        }
+        entries
+    }
+
+    fn appended(appends: &AtomicUsize) -> usize {
+        appends.load(Ordering::SeqCst)
+    }
+
+    #[test]
+    fn writes_arriving_together_are_one_append() {
+        let (store, appends, _) = counting("a");
+        let shared = shared(store);
+        let mut changes = shared.changes.subscribe();
+        let keys: Vec<String> = (0..20).map(|n| format!("k/{n}")).collect();
+        let writes: Vec<_> = keys.iter().map(|key| (key.as_str(), Some(json!(key)), None)).collect();
+        let answers = write_all(&shared, &writes);
+        assert_eq!(appended(&appends), 1, "one append, one sync, for 20 writes");
+        assert!(answers.iter().all(|answer| answer["ok"] == true), "{answers:?}");
+        let stamps: Vec<Hlc> = answers.iter().map(hlc).collect();
+        assert!(stamps.windows(2).all(|pair| pair[0] < pair[1]), "in their order");
+        let published: Vec<String> = published(&mut changes).into_iter().map(|(key, _)| key).collect();
+        assert_eq!(published, keys);
+    }
+
+    #[test]
+    fn a_group_answers_each_write_as_if_it_came_alone() {
+        let (store, appends, _) = counting("a");
+        let shared = shared(store);
+        let before = shared.store().put("k", json!(0), None).unwrap().hlc;
+        let mut changes = shared.changes.subscribe();
+        let answers = write_all(
+            &shared,
+            &[
+                ("k", Some(json!(1)), Some(&before)),
+                // the first changed the stamp: as if one came after the other
+                ("k", Some(json!(2)), Some(&before)),
+                ("_nodes/a", Some(json!(3)), None),
+                ("missing", None, None),
+                ("j", Some(json!(4)), None),
+                ("k", None, Some(&before)),
+            ],
+        );
+        assert_eq!(answers[0]["ok"], true);
+        assert_eq!(answers[1]["code"], "conflict");
+        assert_eq!(answers[1]["current"], answers[0]["entry"]["hlc"]);
+        assert_eq!(answers[2]["code"], "invalid");
+        assert_eq!((&answers[3]["ok"], &answers[3]["entry"]), (&json!(true), &Value::Null));
+        assert_eq!(answers[4]["ok"], true);
+        assert_eq!(answers[5]["code"], "conflict");
+        assert_eq!(appended(&appends), 2, "the write before, then the group");
+        assert_eq!(
+            published(&mut changes),
+            [("k".to_string(), json!(1)), ("j".to_string(), json!(4))]
+        );
+        let store = shared.store();
+        assert_eq!(store.get("k").unwrap().value, json!(1));
+        assert_eq!(store.get("j").unwrap().value, json!(4));
+    }
+
+    #[test]
+    fn a_failed_group_answers_every_write_with_the_error_and_leaves_no_trace() {
+        let (store, _, fail) = counting("a");
+        let shared = shared(store);
+        shared.store().put("k", json!(0), None).unwrap();
+        let mut changes = shared.changes.subscribe();
+        fail.store(true, Ordering::SeqCst);
+        let answers = write_all(
+            &shared,
+            &[
+                ("k", Some(json!(1)), None),
+                ("_nodes/a", Some(json!(2)), None),
+                ("j", Some(json!(3)), None),
+            ],
+        );
+        let codes: Vec<&Value> = answers.iter().map(|answer| &answer["code"]).collect();
+        assert_eq!(codes, [&json!("io"), &json!("invalid"), &json!("io")]);
+        assert!(
+            answers[0]["error"].as_str().unwrap().contains("disk full"),
+            "{answers:?}"
+        );
+        assert!(
+            published(&mut changes).is_empty(),
+            "nothing announced that is not durable"
+        );
+        {
+            let store = shared.store();
+            assert_eq!(store.get("k").unwrap().value, json!(0));
+            assert!(store.get("j").is_none());
+        }
+        fail.store(false, Ordering::SeqCst);
+        let answers = write_all(&shared, &[("j", Some(json!(4)), None)]);
+        assert_eq!(answers[0]["ok"], true);
+    }
+
+    #[test]
+    fn a_failed_group_answers_each_write_its_state_decided_with_the_error() {
+        let (store, _, fail) = counting("a");
+        let shared = shared(store);
+        shared.store().put("k", json!(0), None).unwrap();
+        let mut changes = shared.changes.subscribe();
+        fail.store(true, Ordering::SeqCst);
+        let answers = write_all(
+            &shared,
+            &[
+                ("k", None, None),
+                // finds nothing to delete, since the one before deleted it
+                ("k", None, None),
+                ("j", Some(json!(1)), None),
+                // a conflict with the stamp the one before gave j
+                ("j", Some(json!(2)), Some(&"1-0-a".parse().unwrap())),
+                ("_nodes/a", Some(json!(3)), None),
+            ],
+        );
+        let codes: Vec<&str> = answers.iter().map(|answer| answer["code"].as_str().unwrap()).collect();
+        assert_eq!(codes, ["io", "io", "io", "io", "invalid"], "{answers:?}");
+        assert!(published(&mut changes).is_empty());
+        let store = shared.store();
+        assert_eq!(store.get("k").unwrap().value, json!(0));
+        assert!(store.held("j").is_none());
+    }
+
+    /// Storage whose appends panic, as a bug in the writer would.
+    struct Panicking;
+
+    impl Storage for Panicking {
+        fn load(&mut self) -> io::Result<Vec<Entry>> {
+            Ok(Vec::new())
+        }
+        fn append(&mut self, _: &[Entry]) -> io::Result<()> {
+            panic!("a bug in the writer");
+        }
+        fn compact(&mut self, _: &mut dyn Iterator<Item = &Entry>) -> io::Result<()> {
+            Ok(())
+        }
+        fn appended(&self) -> usize {
+            0
+        }
+        fn appended_bytes(&self) -> u64 {
+            0
+        }
+        fn snapshot_bytes(&self) -> u64 {
+            0
+        }
+        fn damaged(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn a_writer_that_panics_is_noticed() {
+        let store = Store::with_storage(Box::new(Panicking), "a", store::Options::default()).unwrap();
+        let (writes, queued) = mpsc::unbounded_channel();
+        let stopped = start_writer(Arc::new(shared(store)), queued);
+        let answer = match queue(&writes, json!(1), "k".into(), Some(json!(1)), None) {
+            Answer::Later(_, answer) => answer,
+            Answer::Now(answer) => panic!("answered at once: {answer}"),
+        };
+        assert!(answer.blocking_recv().is_err(), "the write is dropped with the writer");
+        assert!(
+            stopped.blocking_recv().is_err(),
+            "the daemon learns that its writer is gone, though it still holds the queue"
+        );
+        drop(writes);
+    }
+
+    #[test]
+    fn a_write_in_place_of_an_own_entry_far_ahead_goes_with_its_group() {
+        let (store, appends, _) = counting("a");
+        let shared = shared(store);
+        // as if loaded from the log: a write of this node made while its clock was far ahead, which the hub never had
+        let far = Hlc {
+            wall_ms: wall_ms() + MAX_DRIFT_MS + 60_000,
+            counter: 0,
+            node: "a".into(),
+        };
+        shared
+            .store()
+            .from_hub(Entry::new("far", Some(json!("ahead")), far.clone()))
+            .unwrap();
+        let mut changes = shared.changes.subscribe();
+        let before = appended(&appends);
+        let answers = write_all(
+            &shared,
+            &[
+                ("a", Some(json!(1)), None),
+                ("far", Some(json!(2)), None),
+                ("b", Some(json!(3)), None),
+            ],
+        );
+        assert!(answers.iter().all(|answer| answer["ok"] == true), "{answers:?}");
+        let stamps: Vec<Hlc> = answers.iter().map(hlc).collect();
+        assert!(stamps.windows(2).all(|pair| pair[0] < pair[1]) && stamps[1] < far);
+        assert_eq!(
+            appended(&appends) - before,
+            0,
+            "the group went in by one compaction, decided by the write's own reading of the clock"
+        );
+        let keys: Vec<String> = published(&mut changes).into_iter().map(|(key, _)| key).collect();
+        assert_eq!(keys, ["a", "far", "b"]);
+        assert_eq!(shared.store().get("far").unwrap().value, json!(2));
+    }
 }

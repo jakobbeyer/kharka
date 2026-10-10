@@ -177,7 +177,8 @@ do not trust each other, or for many people editing the same record at once.
 - Deleted keys stay as tombstones for good, so a store with many short-lived keys grows.
 - One hub: while it is away, every machine keeps working, but changes travel only when it is back.
 - Every node that reaches the hub is trusted ([SECURITY.md](SECURITY.md)).
-- About 100 durable writes a second per daemon on macOS (each one is synced to disk before it is answered).
+- Each write is synced to disk before it is answered: one tool writing value after value gets about 100 durable
+  writes a second on macOS; several tools writing at once share the syncs (group commit) and get several times that.
 
 ## Contributing
 

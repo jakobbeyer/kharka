@@ -1,5 +1,7 @@
 //! The frames between a daemon and the hub: a 4-byte big-endian length, then a JSON object.
 
+use std::borrow::Borrow;
+
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -13,7 +15,7 @@ use crate::hlc::Hlc;
 pub const PROTOCOL: u32 = 1;
 /// The largest frame, in bytes.
 pub const MAX_FRAME: usize = 8 << 20;
-/// Entries are sent in batches of about this many bytes.
+/// Entries are sent in frames of about this many bytes.
 const BATCH_BYTES: usize = 1 << 20;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -115,24 +117,115 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
-/// Splits entries into batches that each fit a frame easily.
-pub fn batches(entries: Vec<Entry>) -> Vec<Vec<Entry>> {
-    let mut batches = Vec::new();
-    let mut batch = Vec::new();
-    let mut size = 0;
-    for entry in entries {
-        let entry_size = entry.key.len() + entry.value.to_string().len() + 100;
-        if !batch.is_empty() && size + entry_size > BATCH_BYTES {
-            batches.push(std::mem::take(&mut batch));
-            size = 0;
+/// Entries as `changes` or `push` frames of about `BATCH_BYTES` each (an entry larger than that in one of its own), every
+/// entry serialised once: the same frames as `Frame::Changes` and `Frame::Push`, without measuring or copying the entries
+/// first.
+pub struct Entries {
+    head: &'static [u8],
+    open: Vec<u8>,
+    full: Vec<Bytes>,
+}
+
+impl Entries {
+    pub fn changes() -> Entries {
+        Entries::with_head(br#"{"type":"changes","entries":["#)
+    }
+
+    pub fn push(restore: bool) -> Entries {
+        Entries::with_head(if restore {
+            br#"{"type":"push","restore":true,"entries":["#
+        } else {
+            br#"{"type":"push","entries":["#
+        })
+    }
+
+    fn with_head(head: &'static [u8]) -> Entries {
+        Entries {
+            head,
+            open: Vec::new(),
+            full: Vec::new(),
         }
-        size += entry_size;
-        batch.push(entry);
     }
-    if !batch.is_empty() {
-        batches.push(batch);
+
+    /// Adds an entry; whether a frame is full now (time to send). The entry is serialised into the open frame; only when
+    /// that makes the frame too large are its bytes moved to a new one.
+    pub fn add(&mut self, entry: &Entry) -> anyhow::Result<bool> {
+        let before = self.open.len();
+        if before == 0 {
+            self.open.extend_from_slice(self.head);
+        } else {
+            self.open.push(b',');
+        }
+        let at = self.open.len();
+        if let Err(err) = serde_json::to_writer(&mut self.open, entry) {
+            self.open.truncate(before);
+            return Err(err.into());
+        }
+        if before > 0 && before + (self.open.len() - at) > BATCH_BYTES {
+            let mut next = Vec::with_capacity(self.head.len() + self.open.len() - at);
+            next.extend_from_slice(self.head);
+            next.extend_from_slice(&self.open[at..]);
+            self.open.truncate(before);
+            self.close();
+            self.open = next;
+        }
+        Ok(!self.full.is_empty())
     }
-    batches
+
+    fn close(&mut self) {
+        if !self.open.is_empty() {
+            self.open.extend_from_slice(b"]}");
+            self.full.push(Bytes::from(std::mem::take(&mut self.open)));
+        }
+    }
+
+    /// The frames made so far, read back.
+    #[cfg(test)]
+    pub(crate) fn read_back(&mut self) -> Vec<Frame> {
+        self.close();
+        self.full
+            .drain(..)
+            .map(|frame| serde_json::from_slice(&frame).unwrap())
+            .collect()
+    }
+
+    /// Writes every frame made so far, with one flush; nothing when there are none.
+    pub async fn send<W: AsyncWrite + Unpin>(
+        &mut self,
+        writer: &mut FramedWrite<W, LengthDelimitedCodec>,
+    ) -> anyhow::Result<()> {
+        self.close();
+        self.send_full(writer).await
+    }
+
+    /// Writes the full frames, and keeps the open one for more entries.
+    async fn send_full<W: AsyncWrite + Unpin>(
+        &mut self,
+        writer: &mut FramedWrite<W, LengthDelimitedCodec>,
+    ) -> anyhow::Result<()> {
+        if self.full.is_empty() {
+            return Ok(());
+        }
+        for frame in self.full.drain(..) {
+            writer.feed(frame).await?;
+        }
+        SinkExt::<Bytes>::flush(writer).await?;
+        Ok(())
+    }
+}
+
+/// Writes entries as `frames` (`Entries::changes` or `Entries::push`), each frame as soon as it is full.
+pub async fn send_entries<W: AsyncWrite + Unpin, E: Borrow<Entry>>(
+    writer: &mut FramedWrite<W, LengthDelimitedCodec>,
+    mut frames: Entries,
+    entries: &[E],
+) -> anyhow::Result<()> {
+    for entry in entries {
+        if frames.add(entry.borrow())? {
+            frames.send_full(writer).await?;
+        }
+    }
+    frames.send(writer).await
 }
 
 #[cfg(test)]
@@ -161,14 +254,60 @@ mod tests {
         );
     }
 
-    #[test]
-    fn batches_stay_small() {
+    /// The frames `send_entries` writes, read back.
+    async fn written(frames: Entries, entries: &[Entry]) -> Vec<Frame> {
+        let mut writer = FramedWrite::new(Vec::new(), codec());
+        send_entries(&mut writer, frames, entries).await.unwrap();
+        let bytes = writer.into_inner();
+        let mut reader = FramedRead::new(&bytes[..], codec());
+        let mut read = Vec::new();
+        while let Some(frame) = recv(&mut reader).await.unwrap() {
+            read.push(frame);
+        }
+        read
+    }
+
+    #[tokio::test]
+    async fn entries_go_in_frames_of_about_a_megabyte() {
         let big = json!("x".repeat(400_000));
-        let entries: Vec<Entry> = (0..7)
+        let mut entries: Vec<Entry> = (0..7)
             .map(|n| Entry::new(format!("k{n}"), Some(big.clone()), "1-0-n".parse().unwrap()))
             .collect();
-        let batches = batches(entries);
-        assert_eq!(batches.iter().map(Vec::len).collect::<Vec<_>>(), [2, 2, 2, 1]);
-        assert!(super::batches(vec![]).is_empty());
+        entries[3].seq = 9;
+        entries.push(Entry::new("gone", None, "2-0-n".parse().unwrap()));
+        let changes = written(Entries::changes(), &entries).await;
+        let expected: Vec<Frame> = entries
+            .chunks(2)
+            .map(|entries| Frame::Changes {
+                entries: entries.to_vec(),
+            })
+            .collect();
+        assert_eq!(changes.len(), 4);
+        assert_eq!(changes, expected);
+
+        // one larger than a frame goes in one of its own
+        let huge = Entry::new("huge", Some(json!("x".repeat(1_200_000))), "3-0-n".parse().unwrap());
+        let mixed = [entries[7].clone(), huge, entries[7].clone()];
+        assert_eq!(
+            written(Entries::changes(), &mixed).await,
+            mixed
+                .iter()
+                .map(|entry| Frame::Changes {
+                    entries: vec![entry.clone()]
+                })
+                .collect::<Vec<_>>()
+        );
+
+        let small = &entries[7..];
+        for restore in [false, true] {
+            assert_eq!(
+                written(Entries::push(restore), small).await,
+                [Frame::Push {
+                    entries: small.to_vec(),
+                    restore
+                }]
+            );
+        }
+        assert!(written(Entries::changes(), &[]).await.is_empty());
     }
 }

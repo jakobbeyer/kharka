@@ -1,6 +1,6 @@
 [package]
 name = "kharka"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A small local-first JSON store: every machine keeps a full replica, one hub orders and spreads the changes"
 license = "MIT"

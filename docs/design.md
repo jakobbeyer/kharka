@@ -125,7 +125,8 @@ that holds it, until the key is written past its stamp.
 ## Sync protocol
 
 Daemon and hub speak in frames over one long-lived, bidirectional stream: a 4-byte big-endian length, then a JSON object
-tagged by `type` (at most 8 MB; entries go in batches of about 1 MB).
+tagged by `type` (at most 8 MB; entries go in batches of about 1 MB, and the live stream sends what is already queued
+for a daemon together, in order, rather than one frame per entry).
 
 ```
 daemon → hub   hello      { version, node, epoch, since, prefixes }
@@ -147,7 +148,8 @@ The protocol version is 1; a hub refuses a daemon with another one.
   should it be lost (a crash before the next compaction), the write is pushed once more and confirmed again. A push
   that changes nothing (an older stamp, or the same push twice) is answered with the entry the hub holds, to the sender
   only, and only once the stream to that sender has passed its sequence number: an answer never overtakes the
-  ordered stream, so a daemon never counts past changes still on their way to it.
+  ordered stream, so a daemon never counts past changes still on their way to it. Such answers go in frames of the
+  usual size, however large the held entries.
 - **Catch-up:** a daemon remembers its position in the hub's sequence: the highest sequence number it holds, or the
   last `caught_up` (kept in `position`), which also counts what a partial replica does not sync. After a reconnect it
   gets only what came after. The hub keeps one entry per key, so a catch-up is at most one entry per key, however long
@@ -159,7 +161,8 @@ The protocol version is 1; a hub refuses a daemon with another one.
   catch-up), forgets every sequence number, so everything it holds becomes pending, and pushes it after the catch-up:
   its own writes as a plain push, every other node's entry as a *restoring* push. The hub takes restored entries as
   they are (the latest stamp still wins), without its checks for a sender's own writes, and leaves out what it decides
-  itself. A hub that lost its data is filled again by its daemons, with every node's writes. After restoring a hub from
+  itself. A restored definition of a collection the hub holds as protected, or an invalid one, does not replace the
+  hub's: the hub restates its version with a later stamp, so the restoring replica takes it too. A hub that lost its data is filled again by its daemons, with every node's writes. After restoring a hub from
   a backup, delete its `epoch` file, so that it counts as a new hub.
 - **Refusals:** the hub refuses a pushed entry with an invalid key, a `_` key other than an own collection or the
   clearing of a `_rejected/` record, a change to a protected collection, an invalid collection definition, a stamp by
@@ -184,7 +187,8 @@ The protocol version is 1; a hub refuses a daemon with another one.
   it is no access control: a daemon may ask for any prefixes.
 - **Back pressure:** a daemon too slow for the stream is caught up from the log (the hub resubscribes and sends what it
   missed); the hub never buffers an unbounded backlog for it, and drops direct answers beyond 1024 (a dropped
-  confirmation only means the write is pushed once more).
+  confirmation only means the write is pushed once more). Refusals are never dropped: a connection with more than 65536
+  of them waiting (a daemon that keeps pushing refused writes and does not read) is closed instead.
 - **Reconnect:** the daemon retries after 1 s, doubling up to 30 s, and reports a hub that stays away once.
 
 ## Storage
@@ -206,8 +210,16 @@ The same in the hub and in every daemon:
   file) is refused ("starts with neither a header nor a record") and left as it is, like a newer format.
 - **Going back:** after loading there is always a `snapshot`, if only the header. kharka 0.0.1 reads the snapshot
   first and refuses to start on one it cannot read, so it stops there and never cuts the log.
-- **Durability:** a tool's write is appended and synced before it is answered (on macOS a full sync, about 7 ms: some
-  100 durable writes a second per daemon). What arrives from the hub, and what the hub takes from one push, is written
+- **Durability:** a tool's write is appended and synced before it is answered. The writes arriving while one is synced
+  wait and then go to the disk together, with one append and one sync (group commit): one sync costs about 7 ms on
+  macOS, so a single tool writing one value after another gets some 100 durable writes a second, and several tools
+  writing at once share the syncs. In a group the writes are made in the order they arrived, each checked against the
+  ones before it (`if_hlc` too); one refused by its own checks gets its error and leaves the others alone; when the
+  group's write fails, none of it stays, and each write gets the error, except one refused by its own checks (key,
+  value, collection). A group holding a write in place of this node's own pending entry stamped far ahead is written
+  by a compaction instead of an append. Under a steady stream of writes, a read (or the sync) waiting for the store
+  gets in after 100 ms at the latest. Should the writer stop (a bug), the daemon ends with an error, so that its
+  service manager starts it anew. What arrives from the hub, and what the hub takes from one push, is written
   as one batch with a single sync, and only published once it is durable: a catch-up of thousands of entries takes a
   fraction of a second, and local reads do not wait for it.
 - **Compaction:** once the log holds more than 1000 records and twice as many as there are entries, or more than 16 MB
